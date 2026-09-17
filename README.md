@@ -34,6 +34,8 @@ This baseline reads typed option probabilities directly from a model. No answer 
 **Apple Silicon:** use the native [MLX backend](docs/MLX.md) for direct scoring,
 serial prefix reuse, and parallel shared-state decisions on macOS arm64.
 Install `pip install -e '.[test,mlx]'` and add `--backend mlx` to the scorer command.
+PyTorch/MPS (`--device mps`) is also supported for direct, serial, and shared modes — see
+[Apple Silicon](docs/APPLE_SILICON.md).
 
 Python 3.10+, CUDA, and a GPU that can hold a 4B BF16 model:
 
@@ -151,6 +153,7 @@ Returned probabilities are conditional on the supplied options. Calibrate and va
 - [Results](docs/RESULTS.md) — quality, speed, perturbations, and claim boundaries
 - [Method](docs/METHOD.md) — frozen prompts, metrics, and timing scope
 - [Reproduce](docs/REPRODUCE.md) — exact environment, pinned commands, perturbations, and verification
+- [Apple Silicon](docs/APPLE_SILICON.md) — MPS and optional MLX backends
 - [Interactive replay](demo/index.html)
 - [Browser-only WebGPU demo](webgpu-demo/index.html) — no waitlist; use it today
 - [Machine-readable summary](results/phase1-summary.json)
