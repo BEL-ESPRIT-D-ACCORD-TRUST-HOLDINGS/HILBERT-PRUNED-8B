@@ -83,6 +83,7 @@ def backends(monkeypatch):
         """Real signature: stale torch-only arguments fail here."""
 
     mlx = ModuleType("semif_phase1.mlx_backend")
+    mlx.DEFAULT_CACHE_LIMIT_MIB = 256
     mlx.load_model = create_autospec(mlx_loader, return_value=loaded)
     mlx.score = Mock(side_effect=results)
     mlx.score_shared = Mock(return_value=(results, timing))
