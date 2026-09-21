@@ -125,25 +125,21 @@ The owned [37×21 fixture](benchmarks/data/shape777.jsonl), [direct/reuse runner
 
 ### General decision baseline
 
-| Frozen workload | Rows | Direct logits (4B) | Native reranker (4B) | Published Jev |
-|---|---:|---:|---:|---:|
-| Authored decisions, balanced accuracy | 144 | **0.813** | 0.625 | — |
-| WANLI, balanced accuracy | 256 | **0.637** | 0.522 | — |
-| TypeSafe selected subset, modal agreement | 102 across 20 cases | **0.845** | 0.560 | 0.883 |
-| Every judgment grid, accuracy | 36 | **0.806** | 0.694 | — |
-| Every action firewall, composed accuracy | 10 actions | 0.700 | 0.700 | — |
-| Every code retrieval, Recall@1 | 6 queries | 1.000 | 1.000 | — |
-| Every company knowledge, Recall@1 | 7 queries | 0.929 | 0.929 | — |
+| Frozen workload | Rows | Direct logits (4B BF16) | EXL3 direct (27B, 5 bpw) | Native reranker (4B) | Published Jev |
+|---|---:|---:|---:|---:|---:|
+| Authored decisions, balanced accuracy | 144 | 0.813 | **0.958** | 0.625 | — |
+| WANLI, balanced accuracy | 256 | **0.637** | — | 0.522 | — |
+| TypeSafe selected subset, modal agreement | 102 across 20 cases | **0.845** | — | 0.560 | 0.883 |
+| Every judgment grid, accuracy | 36 | **0.806** | — | 0.694 | — |
+| Every action firewall, composed accuracy | 10 actions | 0.700 | — | 0.700 | — |
+| Every code retrieval, Recall@1 | 6 queries | 1.000 | — | 1.000 | — |
+| Every company knowledge, Recall@1 | 7 queries | 0.929 | — | 0.929 | — |
 
 The reranker remained strong at retrieval ranking, but direct logits were the better general-decision baseline.
 
 The Jev number is read from TypeSafe's published records; we did not run a live Jev endpoint. The comparison covers the 102 rows that could be aligned from public artifacts, not TypeSafe's reported 711-row aggregate.
 
-### Larger quantized baseline
-
-The experimental [Qwen3.8-27B EXL3 bridge](exl3-bridge/) reaches **0.958 balanced accuracy** on the same 144 authored decisions, compared with 0.813 for the pinned 4B BF16 baseline.
-
-Across the 777-decision shared-state fixture, its choices agree with the pinned 4B model on 84.43% of rows. Model family and quantization both differ, so this is a practical larger-model comparison rather than a quantization ablation.
+The [Qwen3.8-27B EXL3 bridge](exl3-bridge/) uses the same 144 authored rows, matching prompt hashes, options, direct-logit readout, and metric as the 4B baseline. It is a system-level quality comparison rather than a controlled model-size or quantization ablation: model family, size, quantization, and runtime all differ. It has not yet been run on the other quality workloads. Across the 777-decision shared-state fixture, its choices agree with the pinned 4B model on 84.43% of rows.
 
 ### Calibration
 
