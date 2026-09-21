@@ -24,7 +24,15 @@ Jev is TypeSafe's closed service for runtime-defined semantic decisions. This pr
 
 This baseline reads typed option probabilities directly from a model. No answer sentence, JSON repair, or decoding loop.
 
-### Latest changes — 2026-09-18
+### Latest changes
+
+**2026-09-22**
+
+- Added PyTorch/MPS scoring for Apple Silicon — [@dp-IED](https://github.com/dp-IED) in [#15](https://github.com/TheoLeeCJ/SemIf/pull/15).
+- Added a Qwen3.8-27B EXL3 bridge with corrected, committed evidence — [@jkyamog](https://github.com/jkyamog) in [#9](https://github.com/TheoLeeCJ/SemIf/pull/9).
+- Added per-workload temperature calibration and calibrated prediction outputs — [@samarthpatel24](https://github.com/samarthpatel24) in [#19](https://github.com/TheoLeeCJ/SemIf/pull/19).
+
+**2026-09-18**
 
 - Added MiniCPM5 2B and Qwen3.5 4B to the browser demo.
 - Added **Unsloppify site**, a switch to a conventional interface.
@@ -131,6 +139,24 @@ The reranker remained strong at retrieval ranking, but direct logits were the be
 
 The Jev number is read from TypeSafe's published records; we did not run a live Jev endpoint. The comparison covers the 102 rows that could be aligned from public artifacts, not TypeSafe's reported 711-row aggregate.
 
+### Larger quantized baseline
+
+The experimental [Qwen3.8-27B EXL3 bridge](exl3-bridge/) reaches **0.958 balanced accuracy** on the same 144 authored decisions, compared with 0.813 for the pinned 4B BF16 baseline.
+
+Across the 777-decision shared-state fixture, its choices agree with the pinned 4B model on 84.43% of rows. Model family and quantization both differ, so this is a practical larger-model comparison rather than a quantization ablation.
+
+### Calibration
+
+Option probabilities are useful only when their confidence matches observed accuracy. SemIf includes per-workload temperature scaling fitted on labeled decisions:
+
+| Workload | Raw ECE | Calibrated ECE, out of fold | Temperature |
+|---|---:|---:|---:|
+| Authored decisions | 0.068 | **0.038** | 1.23 |
+| WANLI | 0.208 | **0.069** | 2.50 |
+| Every judgments | 0.050 | 0.047 | 1.71 |
+
+Calibration does not change the selected option. The clear improvement is on WANLI; the intervals overlap on the authored and Every workloads. See the [method, caveats, and reproduction commands](docs/CALIBRATION.md).
+
 ## Input
 
 ```json
@@ -154,6 +180,8 @@ Returned probabilities are conditional on the supplied options. Calibrate and va
 - [Method](docs/METHOD.md) — frozen prompts, metrics, and timing scope
 - [Reproduce](docs/REPRODUCE.md) — exact environment, pinned commands, perturbations, and verification
 - [Apple Silicon](docs/APPLE_SILICON.md) — MPS and optional MLX backends
+- [Calibration](docs/CALIBRATION.md) — fitted temperatures, out-of-fold evidence, and application
+- [EXL3 bridge](exl3-bridge/README.md) — quantized 27B runner and committed evidence
 - [Interactive replay](demo/index.html)
 - [Browser-only WebGPU demo](webgpu-demo/index.html) — no waitlist; use it today
 - [Machine-readable summary](results/phase1-summary.json)
@@ -170,6 +198,6 @@ Returned probabilities are conditional on the supplied options. Calibrate and va
 - [TypeSafe public evaluations](https://evals.typesafe.ai/) — public comparison cases used for selected-subset agreement
 - [Every parallel judgment lab](https://typesafe-parallel-judgment-lab.every-4573.chatgpt.site/) and its [downloadable experiment data](https://typesafe-parallel-judgment-lab.every-4573.chatgpt.site/downloads/experiments.json)
 - [WANLI](https://huggingface.co/datasets/alisawuffles/WANLI) — external natural-language inference check
-- [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B), [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), and [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B) — frozen baseline models
+- [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B), [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B), and [Qwen3.8-27B EXL3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3) — frozen baseline and bridge models
 
 Model weights and third-party source records are not included. Upstream models retain their licenses. Project code is released under the [MIT License](LICENSE).
