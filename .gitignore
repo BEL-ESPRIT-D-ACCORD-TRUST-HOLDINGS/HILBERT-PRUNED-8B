@@ -2,7 +2,9 @@
 *.egg-info/
 __pycache__/
 .pytest_cache/
+.claude/
 *.pyc
+*.egg-info/
 results*.jsonl
 reranker-results*.jsonl
 models/

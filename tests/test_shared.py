@@ -1,6 +1,10 @@
+from types import SimpleNamespace
+
 import pytest
 
-from semif_phase1.shared import _suffix_layout
+torch = pytest.importorskip("torch")
+
+from semif_phase1.shared import _suffix_layout, score_shared  # noqa: E402
 
 
 def test_suffix_padding_follows_real_tokens():
@@ -14,3 +18,75 @@ def test_suffix_padding_follows_real_tokens():
 def test_empty_suffix_is_rejected():
     with pytest.raises(ValueError):
         _suffix_layout([[1], []], 7, 0)
+
+
+class FakeCache:
+    """Native-cache stand-in: mutable length, records reorder calls."""
+
+    def __init__(self, length):
+        self.length = length
+        self.orders = []
+
+    def get_seq_length(self):
+        return self.length
+
+    def reorder_cache(self, order):
+        self.orders.append(order.tolist() if hasattr(order, "tolist") else list(order))
+
+    def __deepcopy__(self, memo):
+        clone = FakeCache(self.length)
+        memo[id(self)] = clone
+        return clone
+
+
+class FakeModel:
+    """Forward with a real signature so selective-logits detection succeeds."""
+
+    def __init__(self, calls, device):
+        self.calls = calls
+        self._device = device
+
+    def parameters(self):
+        yield SimpleNamespace(device=self._device)
+
+    def eval(self):
+        return self
+
+    def forward(self, input_ids=None, attention_mask=None, use_cache=False,
+                return_dict=True, logits_to_keep=1, past_key_values=None):
+        width = int(input_ids.shape[1])
+        entry_length = None if past_key_values is None else past_key_values.length
+        self.calls.append({"batch": int(input_ids.shape[0]), "entry_length": entry_length})
+        if past_key_values is None:
+            past_key_values = FakeCache(width)
+        else:
+            past_key_values.length += width
+        logits = torch.arange(width + 4, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
+        return SimpleNamespace(logits=logits, past_key_values=past_key_values)
+
+    __call__ = forward
+
+
+def test_score_shared_looped_path_forwards_one_row_per_call(monkeypatch):
+    if not torch.backends.mps.is_available():
+        pytest.skip("MPS unavailable")
+    rows_data = [
+        {"id": key, "state": "s", "question": f"q{index}",
+         "options": [{"id": "x", "description": "X"}, {"id": "y", "description": "Y"}]}
+        for index, key in enumerate(("a", "b"))
+    ]
+    monkeypatch.setattr("semif_phase1.shared.encode_prompt",
+                        lambda tok, row, limit: ([1] * 8, [2, 3], f"hash-{row['id']}"))
+    monkeypatch.setattr("semif_phase1.shared._state_prefix", lambda tokenizer, state: [1] * 6)
+    calls = []
+    results, timing = score_shared(FakeModel(calls, torch.device("mps")),
+                                   SimpleNamespace(pad_token_id=0, eos_token_id=1), rows_data, {}, 4096)
+    assert [r["id"] for r in results] == ["a", "b"]
+    assert len(calls) == 3  # one prefill + one batch-1 suffix forward per row
+    prefill, *suffixes = calls
+    assert prefill["entry_length"] is None
+    # Each branch starts at prefix length: deep-copied, not shared state.
+    assert all(call["batch"] == 1 and call["entry_length"] == 6 for call in suffixes)
+    assert timing["replicate_seconds"] > 0 and timing["suffix_forward_seconds"] > 0
+    assert timing["padded_suffix_tokens"] == timing["true_suffix_tokens"] == 4
+    assert all(sum(result["probabilities"]) == pytest.approx(1.0) for result in results)
