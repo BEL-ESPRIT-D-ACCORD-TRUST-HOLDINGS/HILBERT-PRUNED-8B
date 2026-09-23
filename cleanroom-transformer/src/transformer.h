@@ -119,7 +119,16 @@ typedef struct {
 } decision_t;
 
 int decision_validate(const jval *row, decision_t *out);
-void decision_prompt(const decision_t *d, sbuf_t *out);
+/* Chat templates the engine can render byte for byte (SPEC.md section 2). */
+typedef enum { CHAT_QWEN35 = 0, CHAT_LLAMA3 = 1 } chat_kind_t;
+typedef struct {
+    chat_kind_t kind;
+    char bos[64]; /* text prepended by the template, if any */
+} chat_format_t;
+
+/* Reads chat_template.jinja or tokenizer_config.json in `dir` and identifies the template. */
+int chat_format_load(const char *dir, chat_format_t *out);
+void decision_prompt(const decision_t *d, const chat_format_t *fmt, sbuf_t *out);
 
 typedef struct {
     uint32_t *ids;
@@ -128,7 +137,8 @@ typedef struct {
     char sha256[65];
 } encoded_t;
 
-int decision_encode(const tokenizer_t *t, const decision_t *d, size_t max_tokens, encoded_t *out);
+int decision_encode(const tokenizer_t *t, const chat_format_t *fmt, const decision_t *d, size_t max_tokens,
+                    encoded_t *out);
 void encoded_free(encoded_t *e);
 
 /* ------------------------------------------------------------- safetensors */
@@ -158,13 +168,19 @@ void st_close(st_set_t *s);
 
 /* ------------------------------------------------------------------- model */
 enum { LAYER_LINEAR = 0, LAYER_FULL = 1 };
+enum { ARCH_QWEN35 = 0, ARCH_LLAMA = 1 };
 
 typedef struct {
     uint32_t hidden, n_layers, intermediate, vocab;
     uint32_t n_heads, n_kv_heads, head_dim, rot_dim;
     uint32_t lin_k_heads, lin_v_heads, lin_k_dim, lin_v_dim, conv_k;
+    uint32_t arch;
     float eps, rope_theta;
-    bool attn_gate, tied;
+    float norm_offset;        /* RMSNorm scale is (norm_offset + w): 1 for Qwen3.5, 0 for Llama */
+    bool attn_gate, qk_norm, tied;
+    /* Llama 3.1-style RoPE frequency scaling (rope_type "llama3") */
+    bool rope_llama3;
+    float rope_factor, rope_low_freq, rope_high_freq, rope_orig_ctx;
     uint8_t layer_type[256];
     uint32_t n_full, n_linear;
 } config_t;
@@ -231,6 +247,7 @@ typedef struct {
     tokenizer_t *tok;
     backend_t *be;
     size_t max_tokens;
+    chat_format_t fmt;
     char revision[128];
 } engine_t;
 

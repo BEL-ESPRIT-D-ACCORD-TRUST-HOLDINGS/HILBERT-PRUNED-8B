@@ -62,6 +62,17 @@ renders:
 The template trims message content. Neither `SYSTEM` nor a JSON object has
 leading or trailing whitespace, so trimming changes nothing.
 
+For Llama 3 Instruct (a template with `<|start_header_id|>` and
+`<|eot_id|>`, and without the Llama 3.1 date or tools preamble), it renders:
+
+    BOS "<|start_header_id|>system<|end_header_id|>\n\n" SYSTEM "<|eot_id|>"
+    "<|start_header_id|>user<|end_header_id|>\n\n" payload "<|eot_id|>"
+    "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+`BOS` is `tokenizer_config.json`'s `bos_token` (`<|begin_of_text|>`). The
+template is read from `chat_template.jinja` or `tokenizer_config.json`. Other
+templates are refused, and so are base models, which have no template.
+
 `prompt_sha256` is the lowercase hex SHA-256 of the UTF-8 prompt text.
 
 ## 3. Tokenizer (byte-level BPE)
@@ -184,6 +195,33 @@ layers add `self_attn.{q,k,v,o}_proj.weight` and
 `linear_attn.norm.weight`. Also `embed_tokens.weight` and `norm.weight`.
 `lm_head.weight` is used when embeddings are not tied. `mtp.*` and
 `model.visual.*` are ignored. BF16, F16 and F32 are accepted.
+
+### 4.5 Model (Llama)
+
+`model_type == "llama"`. All layers use plain attention. For Llama 3 8B:
+32 layers, `H = 4096`, 32 query heads, 8 KV heads, `d = 128`, `I = 14336`,
+`V = 128256`, `eps = 1e-5`, and a separate `lm_head.weight`.
+
+- Norms are plain RMSNorm, `rms(x) * w`, not `1 + w`.
+- Attention is as in 4.1, without q/k norms and without an output gate:
+  `q = W_q h` has `nh * d` values. RoPE covers all `d` dims (half-split
+  layout, `theta = 500000`).
+- `rope_type == "llama3"` (Llama 3.1) rescales each frequency `f` with
+  wavelength `λ = 2π/f`, where `L = original_max_position_embeddings`:
+  - if `λ > L/low_freq_factor`, then `f / factor`;
+  - if `λ < L/high_freq_factor`, then `f` unchanged;
+  - otherwise `(1-s) f/factor + s f`, with
+    `s = (L/λ - low_freq_factor) / (high_freq_factor - low_freq_factor)`.
+- Attention or MLP biases are refused.
+
+Llama tokenizers skip NFC (`normalizer` is null). They use the pattern
+
+    (?i:'s|'t|'re|'ve|'m|'ll|'d) | [^\r\n\p{L}\p{N}]? \p{L}+ | \p{N}{1,3}
+    | ␠? [^\s\p{L}\p{N}]+ [\r\n]* | \s* [\r\n]+ | \s+ (?!\S) | \s+
+
+Marks (`\p{M}`) count as punctuation, not letters. With
+`ignore_merges == true`, a piece that is already a vocabulary entry is
+emitted whole, before any merging.
 
 ## 5. Readout
 

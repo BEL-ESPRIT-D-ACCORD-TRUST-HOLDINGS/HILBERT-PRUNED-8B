@@ -63,12 +63,12 @@ static void matmul(const wmat_t *w, const float *x, size_t T, float *y, bool acc
     }
 }
 
-/* out = rms(x) * (1 + w) */
-static void norm1p(const float *x, const float *w, float *out, size_t n, float eps) {
+/* out = rms(x) * (off + w); off is 1 for zero-centred norms (Qwen3.5), 0 for plain RMSNorm (Llama) */
+static void rmsnorm(const float *x, const float *w, float off, float *out, size_t n, float eps) {
     double ss = 0;
     for (size_t k = 0; k < n; k++) ss += (double)x[k] * x[k];
     float inv = 1.0f / sqrtf((float)(ss / (double)n) + eps);
-    for (size_t k = 0; k < n; k++) out[k] = x[k] * inv * (1.0f + w[k]);
+    for (size_t k = 0; k < n; k++) out[k] = x[k] * inv * (off + w[k]);
 }
 
 static int cpu_reset(backend_t *b) {
@@ -98,7 +98,7 @@ static void full_attention(cpu_t *c, const layer_t *L, const float *h, size_t T,
         float p = (float)(pos0 + t);
         for (size_t j = 0; j < nh + nkv; j++) {
             float *x = j < nh ? qg + t * qw + j * hd * (cfg->attn_gate ? 2 : 1) : k + t * kvw + (j - nh) * hd;
-            norm1p(x, j < nh ? L->q_norm : L->k_norm, x, hd, cfg->eps);
+            if (cfg->qk_norm) rmsnorm(x, j < nh ? L->q_norm : L->k_norm, cfg->norm_offset, x, hd, cfg->eps);
             for (size_t i = 0; i < rot / 2; i++) {
                 float a = inv[i] * p, cs = cosf(a), sn = sinf(a);
                 float x1 = x[i], x2 = x[i + rot / 2];
@@ -246,7 +246,7 @@ static int cpu_forward(backend_t *b, const uint32_t *tokens, size_t T, const uin
     for (size_t t = 0; t < T; t++) widen_row(&m->embed, tokens[t], x + t * H);
     for (uint32_t l = 0; l < cfg->n_layers; l++) {
         const layer_t *L = &m->layers[l];
-        for (size_t t = 0; t < T; t++) norm1p(x + t * H, L->in_norm, h + t * H, H, cfg->eps);
+        for (size_t t = 0; t < T; t++) rmsnorm(x + t * H, L->in_norm, cfg->norm_offset, h + t * H, H, cfg->eps);
         if (L->type == LAYER_FULL) {
             full_attention(c, L, h, T, mixo);
             matmul(&L->o, mixo, T, x, true);
@@ -254,13 +254,13 @@ static int cpu_forward(backend_t *b, const uint32_t *tokens, size_t T, const uin
             linear_attention(c, L, h, T, mixo);
             matmul(&L->out, mixo, T, x, true);
         }
-        for (size_t t = 0; t < T; t++) norm1p(x + t * H, L->post_norm, h + t * H, H, cfg->eps);
+        for (size_t t = 0; t < T; t++) rmsnorm(x + t * H, L->post_norm, cfg->norm_offset, h + t * H, H, cfg->eps);
         matmul(&L->gate, h, T, g, false);
         matmul(&L->up, h, T, u, false);
         for (size_t k = 0; k < T * cfg->intermediate; k++) g[k] = siluf_(g[k]) * u[k];
         matmul(&L->down, g, T, x, true);
     }
-    norm1p(x + (T - 1) * H, m->final_norm, h, H, cfg->eps);
+    rmsnorm(x + (T - 1) * H, m->final_norm, cfg->norm_offset, h, H, cfg->eps);
     float *row = xmalloc(H * sizeof *row);
     for (uint32_t k = 0; k < n_ids; k++) {
         widen_row(&m->lm_head, ids[k], row);

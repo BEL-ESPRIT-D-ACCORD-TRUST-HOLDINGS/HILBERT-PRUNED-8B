@@ -1,5 +1,5 @@
 /* tokenizer.c - byte-level BPE loaded from a Hugging Face tokenizer.json.
- * Implements SPEC.md section 3. */
+ * Implements SPEC.md section 3: the Qwen3.5 and Llama 3 pre-tokenizer patterns. */
 #include "transformer.h"
 
 #include <stdlib.h>
@@ -20,8 +20,19 @@ typedef struct {
     uint32_t len, id;
 } added_t;
 
+/* The pre-tokenizer regexes this file implements by hand. Anything else is refused. */
+enum { PRETOK_QWEN35 = 0, PRETOK_LLAMA3 = 1 };
+static const char *PRETOK_PATTERNS[] = {
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+|\\p{N}| ?[^\\s\\p{L}\\p{M}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+    "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}{1,3}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|\\s+(?!\\S)|\\s+",
+};
+
 struct tokenizer {
     arena_t arena;
+    int pretok;
+    bool nfc, ignore_merges;
+    char byte_str[256][3]; /* byte-level alphabet as UTF-8 */
+    uint8_t byte_len[256];
     vslot_t *vocab;
     size_t vocab_cap;
     mslot_t *merges;
@@ -138,7 +149,24 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
     const jval *norm = json_get(root, "normalizer");
     const jval *ntype = json_get(norm, "type");
     if (norm && norm->type != J_NULL && (!json_is_str(ntype) || strcmp(ntype->u.str, "NFC") != 0)) {
-        set_error("tokenizer: only the NFC normalizer is supported");
+        set_error("tokenizer: only the NFC normalizer (or none) is supported");
+        goto done;
+    }
+    t->nfc = norm && norm->type != J_NULL;
+    const jval *im = json_get(model, "ignore_merges");
+    t->ignore_merges = im && im->type == J_TRUE;
+    /* pre_tokenizer: Sequence[Split(Regex), ByteLevel(use_regex=false)] with a known regex */
+    const jval *pre = json_get(root, "pre_tokenizer"), *seq = json_get(pre, "pretokenizers");
+    const jval *split = seq && seq->type == J_ARRAY && seq->n == 2 ? seq->u.items[0] : NULL;
+    const jval *bl = split ? seq->u.items[1] : NULL;
+    const jval *pat = json_get(json_get(split, "pattern"), "Regex"), *btype = json_get(bl, "type");
+    const jval *use_regex = json_get(bl, "use_regex"), *behavior = json_get(split, "behavior");
+    t->pretok = -1;
+    for (int k = 0; json_is_str(pat) && k < (int)(sizeof PRETOK_PATTERNS / sizeof *PRETOK_PATTERNS); k++)
+        if (strlen(PRETOK_PATTERNS[k]) == pat->n && !memcmp(PRETOK_PATTERNS[k], pat->u.str, pat->n)) t->pretok = k;
+    if (t->pretok < 0 || !json_is_str(btype) || strcmp(btype->u.str, "ByteLevel") || !use_regex ||
+        use_regex->type != J_FALSE || !json_is_str(behavior) || strcmp(behavior->u.str, "Isolated")) {
+        set_error("tokenizer: unsupported pre_tokenizer (only the Qwen3.5 and Llama 3 patterns are implemented)");
         goto done;
     }
     const jval *vocab = json_get(model, "vocab"), *merges = json_get(model, "merges");
@@ -194,6 +222,8 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
             goto done;
         }
         t->byte_id[b] = v->id;
+        memcpy(t->byte_str[b], u, (size_t)n);
+        t->byte_len[b] = (uint8_t)n;
     }
     const jval *added = json_get(root, "added_tokens");
     if (added && added->type == J_ARRAY) {
@@ -322,6 +352,22 @@ static void bpe_word(const tokenizer_t *t, const unsigned char *w, size_t n, out
         emit(o, t->byte_id[w[0]]);
         return;
     }
+    if (t->ignore_merges) {
+        /* A piece that is already a vocabulary entry is emitted whole. */
+        char stack[512] = {0};
+        char *mapped = n * 2 <= sizeof stack ? stack : xmalloc(n * 2);
+        size_t m = 0;
+        for (size_t i = 0; i < n; i++) {
+            memcpy(mapped + m, t->byte_str[w[i]], t->byte_len[w[i]]);
+            m += t->byte_len[w[i]];
+        }
+        const vslot_t *v = vocab_find(t, mapped, m);
+        if (mapped != stack) free(mapped);
+        if (v) {
+            emit(o, v->id);
+            return;
+        }
+    }
     sym_t *s = xmalloc(n * sizeof *s);
     for (size_t i = 0; i < n; i++)
         s[i] = (sym_t){t->byte_id[w[i]], (int32_t)i - 1, i + 1 < n ? (int32_t)(i + 1) : -1, true};
@@ -361,15 +407,18 @@ static size_t space_run(const ch_t *c, size_t n, size_t i) {
     return i;
 }
 
-static bool is_other(const ch_t *c) { return !c->space && !(c->cls & (UC_L | UC_M | UC_N)); }
-
 static bool fold_is(uint32_t cp, char lower) {
     if (cp == (uint32_t)lower || cp == (uint32_t)(lower - 32)) return true;
     return lower == 's' && cp == 0x17F; /* LATIN SMALL LETTER LONG S folds to s */
 }
 
-/* Returns the end (exclusive) of the match starting at i (SPEC.md 3.3). */
-static size_t match_at(const ch_t *c, size_t n, size_t i) {
+/* Returns the end (exclusive) of the match starting at i (SPEC.md 3.3).
+ * Qwen3.5 treats marks (\p{M}) as letters; Llama 3 treats them as punctuation and groups up to
+ * three digits. */
+static size_t match_at(const ch_t *c, size_t n, size_t i, int pretok) {
+    const unsigned word = pretok == PRETOK_QWEN35 ? (UC_L | UC_M) : UC_L;
+    const unsigned not_other = pretok == PRETOK_QWEN35 ? (UC_L | UC_M | UC_N) : (UC_L | UC_N);
+    const size_t max_digits = pretok == PRETOK_QWEN35 ? 1 : 3;
     /* 1: contractions */
     if (c[i].cp == '\'' && i + 1 < n) {
         uint32_t a = c[i + 1].cp;
@@ -381,26 +430,30 @@ static size_t match_at(const ch_t *c, size_t n, size_t i) {
                 return i + 3;
         }
     }
-    /* 2: [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+ */
+    /* 2: [^\r\n\p{L}\p{N}]?WORD+   (WORD = [\p{L}\p{M}] for Qwen3.5, \p{L} for Llama 3) */
     {
         size_t j = i;
         if (!is_crlf(c[i].cp) && !(c[i].cls & (UC_L | UC_N))) {
             j = i + 1;
             size_t e = j;
-            while (e < n && (c[e].cls & (UC_L | UC_M))) e++;
+            while (e < n && (c[e].cls & word)) e++;
             if (e > j) return e;
         }
         size_t e = i;
-        while (e < n && (c[e].cls & (UC_L | UC_M))) e++;
+        while (e < n && (c[e].cls & word)) e++;
         if (e > i) return e;
     }
-    /* 3: \p{N} */
-    if (c[i].cls & UC_N) return i + 1;
-    /* 4: ' '?[^\s\p{L}\p{M}\p{N}]+[\r\n]* */
+    /* 3: \p{N} (Qwen3.5) or \p{N}{1,3} (Llama 3) */
+    if (c[i].cls & UC_N) {
+        size_t e = i + 1;
+        while (e < n && e - i < max_digits && (c[e].cls & UC_N)) e++;
+        return e;
+    }
+    /* 4: ' '?OTHER+[\r\n]*   (OTHER = not white space and not in `not_other`) */
     {
         size_t j = i + (c[i].cp == ' ' ? 1 : 0);
         size_t e = j;
-        while (e < n && is_other(&c[e])) e++;
+        while (e < n && !c[e].space && !(c[e].cls & not_other)) e++;
         if (e > j) {
             while (e < n && is_crlf(c[e].cp)) e++;
             return e;
@@ -422,7 +475,14 @@ static size_t match_at(const ch_t *c, size_t n, size_t i) {
 
 static void encode_segment(const tokenizer_t *t, const char *seg, size_t seg_len, out_t *o) {
     size_t n;
-    char *norm = uc_nfc(seg, seg_len, &n);
+    char *norm;
+    if (t->nfc) {
+        norm = uc_nfc(seg, seg_len, &n);
+    } else {
+        norm = xmalloc(seg_len + 1);
+        memcpy(norm, seg, seg_len);
+        n = seg_len;
+    }
     ch_t *c = xmalloc((n + 1) * sizeof *c);
     size_t m = 0;
     for (size_t i = 0; i < n;) {
@@ -432,7 +492,7 @@ static void encode_segment(const tokenizer_t *t, const char *seg, size_t seg_len
         i += (size_t)k;
     }
     for (size_t i = 0; i < m;) {
-        size_t e = match_at(c, m, i);
+        size_t e = match_at(c, m, i, t->pretok);
         size_t b0 = c[i].off, b1 = e < m ? c[e].off : n;
         bpe_word(t, (const unsigned char *)norm + b0, b1 - b0, o);
         i = e;

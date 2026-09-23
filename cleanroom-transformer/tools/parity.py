@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Compare the engine against the Hugging Face / PyTorch reference.
 
-Builds tiny random Qwen3.5 text checkpoints with transformers, then checks:
+Builds tiny random Qwen3.5 and Llama checkpoints with transformers, then checks:
 
   1. tokenizer ids against HF `tokenizers` on a fixed corpus plus 400 random
      strings, and prompt bytes, token ids and answer slots against
@@ -14,7 +14,8 @@ Builds tiny random Qwen3.5 text checkpoints with transformers, then checks:
 
 Needs: torch (CPU is fine), transformers==5.17.0, safetensors.
 
-    python tools/parity.py --binary build/cleanroom-transformer --tokenizer /path/to/tokenizer.json
+    python tools/parity.py --tokenizer /path/to/Qwen3.5-4B/tokenizer.json \
+                           --llama-tokenizer /path/to/Llama-3-8B-Instruct/tokenizer.json
 """
 from __future__ import annotations
 
@@ -35,6 +36,34 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 VOCAB = 248320
+LLAMA_VOCAB = 128256
+
+
+def tiny_llama_config(layers: int, rope_scaling: bool):
+    from transformers import LlamaConfig
+
+    rope = {"rope_type": "default", "rope_theta": 500000.0}
+    if rope_scaling:
+        # a small original context so the scaled band covers the tested positions
+        rope = {"rope_type": "llama3", "rope_theta": 500000.0, "factor": 8.0, "low_freq_factor": 1.0,
+                "high_freq_factor": 4.0, "original_max_position_embeddings": 32}
+    return LlamaConfig(vocab_size=LLAMA_VOCAB, hidden_size=64, intermediate_size=96, num_hidden_layers=layers,
+                       num_attention_heads=4, num_key_value_heads=2, rms_norm_eps=1e-5, rope_parameters=rope,
+                       tie_word_embeddings=False, max_position_embeddings=256)
+
+
+def build_llama(seed: int, layers: int, rope_scaling: bool = False):
+    from transformers import LlamaForCausalLM
+
+    torch.manual_seed(seed)
+    model = LlamaForCausalLM(tiny_llama_config(layers, rope_scaling)).eval()
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if "norm" in name:
+                p.copy_(1.0 + torch.randn_like(p) * 0.3)
+            else:
+                p.copy_(torch.randn_like(p) * (0.5 / math.sqrt(p.shape[-1])))
+    return model
 
 
 def tiny_config(layers: int = 4):
@@ -83,13 +112,15 @@ def build_model(seed: int, layers: int):
 def export(model, out: Path, dtype: torch.dtype, prefix: str, shards: int, tokenizer: Path | None):
     out.mkdir(parents=True)
     state = {}
+    tied = model.config.tie_word_embeddings
     for name, tensor in model.state_dict().items():
-        if name == "lm_head.weight":
-            continue  # tied
-        key = name if prefix == "model." else name.replace("model.", prefix, 1)
+        if name == "lm_head.weight" and tied:
+            continue
+        key = name if prefix == "model." or name.startswith("lm_head") else name.replace("model.", prefix, 1)
         state[key] = tensor.detach().to(dtype).contiguous()
     cfg = model.config.to_dict()
-    cfg["model_type"] = "qwen3_5_text"
+    if cfg["model_type"].startswith("qwen3_5"):
+        cfg["model_type"] = "qwen3_5_text"
     (out / "config.json").write_text(json.dumps(cfg, indent=1))
     names = sorted(state)
     if shards == 1:
@@ -103,7 +134,9 @@ def export(model, out: Path, dtype: torch.dtype, prefix: str, shards: int, token
             weight_map.update({k: fname for k in part})
         (out / "model.safetensors.index.json").write_text(json.dumps({"weight_map": weight_map}))
     if tokenizer:
-        shutil.copy(tokenizer, out / "tokenizer.json")
+        for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+            if (tokenizer.parent / name).exists():
+                shutil.copy(tokenizer.parent / name, out / name)
 
 
 def reference_logits(model, tokens, ids, dtype):
@@ -125,17 +158,22 @@ def run(binary: Path, *args: str) -> str:
 def check_logits(binary: Path, workdir: Path, failures: list[str]) -> None:
     rng = random.Random(3)
     cases = [
-        ("f32-1shard-model.", torch.float32, "model.", 1, 1e-4),
-        ("f32-3shard-language_model", torch.float32, "model.language_model.", 3, 1e-4),
-        ("bf16-2shard", torch.bfloat16, "model.", 2, 1e-4),
+        ("qwen35-f32-1shard-model.", lambda s: build_model(s, 8), torch.float32, "model.", 1),
+        ("qwen35-f32-3shard-language_model", lambda s: build_model(s, 8), torch.float32, "model.language_model.", 3),
+        ("qwen35-bf16-2shard", lambda s: build_model(s, 8), torch.bfloat16, "model.", 2),
+        ("llama-f32", lambda s: build_llama(s, 3), torch.float32, "model.", 1),
+        ("llama-f16-2shard", lambda s: build_llama(s, 3), torch.float16, "model.", 2),
+        ("llama-bf16-rope-llama3", lambda s: build_llama(s, 3, rope_scaling=True), torch.bfloat16, "model.", 1),
     ]
-    for seed, (label, dtype, prefix, shards, tol) in enumerate(cases):
-        model = build_model(seed, layers=8)
+    tol = 1e-4
+    for seed, (label, make, dtype, prefix, shards) in enumerate(cases):
+        model = make(seed)
+        vocab = model.config.vocab_size
         path = workdir / label
         export(model, path, dtype, prefix, shards, None)
         for length in (1, 7, 40):
-            tokens = [rng.randrange(VOCAB) for _ in range(length)]
-            ids = [rng.randrange(VOCAB) for _ in range(5)]
+            tokens = [rng.randrange(vocab) for _ in range(length)]
+            ids = [rng.randrange(vocab) for _ in range(5)]
             want = reference_logits(model, tokens, ids, dtype)
             argv = ["--model", str(path), "--backend", "cpu", "--max-tokens", "64",
                     "--tokens", " ".join(map(str, tokens)), "--ids", " ".join(map(str, ids))]
@@ -144,7 +182,7 @@ def check_logits(binary: Path, workdir: Path, failures: list[str]) -> None:
                 err = max(abs(a - b) for a, b in zip(got, want))
                 scale = max(1.0, max(abs(x) for x in want))
                 status = "ok" if err <= tol * scale else "FAIL"
-                print(f"  logits {label:28s} T={length:<3d} split={split:<3d} max|diff|={err:.2e} {status}")
+                print(f"  logits {label:34s} T={length:<3d} split={split:<3d} max|diff|={err:.2e} {status}")
                 if status != "ok":
                     failures.append(f"logits {label} T={length} split={split}: {err:.3e}")
 
@@ -177,15 +215,15 @@ def check_tokenizer(binary: Path, workdir: Path, tokenizer: Path, failures: list
         failures.append(f"tokenizer: {len(bad)} mismatches, first {bad[0][:40]!r}" if bad else "tokenizer: line count")
 
 
-def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, failures: list[str]) -> None:
-    from transformers import PreTrainedTokenizerFast
+def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, failures: list[str],
+               model=None, label: str = "qwen35") -> None:
+    from transformers import AutoTokenizer
     from semif_phase1.core import softmax
     from semif_phase1.direct import encode_prompt
 
-    tok = PreTrainedTokenizerFast(tokenizer_file=str(tokenizer))
-    tok.chat_template = (Path(tokenizer).parent / "chat_template.jinja").read_text()
-    model = build_model(11, layers=4)
-    path = workdir / "rows-model"
+    tok = AutoTokenizer.from_pretrained(str(Path(tokenizer).parent))
+    model = model if model is not None else build_model(11, layers=4)
+    path = workdir / f"rows-{label}"
     export(model, path, torch.float32, "model.", 1, tokenizer)
     rows = [json.loads(line) for line in rows_path.read_text().splitlines() if line.strip()]
     expected = {}
@@ -195,7 +233,7 @@ def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, fa
             logits = model(input_ids=torch.tensor([ids])).logits[0, -1]
         expected[row["id"]] = (digest, len(ids), softmax([float(logits[s]) for s in slots]))
     for mode in ("direct", "shared"):
-        out = workdir / f"results-{mode}.jsonl"
+        out = workdir / f"results-{label}-{mode}.jsonl"
         run(binary, "score", "--model", str(path), "--revision", "tiny-random", "--backend", "cpu",
             "--mode", mode, "--input", str(rows_path), "--output", str(out))
         for line in out.read_text().splitlines():
@@ -203,7 +241,7 @@ def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, fa
             digest, n, probs = expected[got["id"]]
             err = max(abs(a - b) for a, b in zip(got["probabilities"], probs))
             ok = got["prompt_sha256"] == digest and got["input_tokens"] == n and err < 1e-4
-            print(f"  score  {mode:6s} {got['id']:12s} sha256={'match' if got['prompt_sha256'] == digest else 'DIFF'}"
+            print(f"  score  {label:6s} {mode:6s} {got['id']:12s} sha256={'match' if got['prompt_sha256'] == digest else 'DIFF'}"
                   f" tokens={got['input_tokens']}/{n} max|dp|={err:.1e} {'ok' if ok else 'FAIL'}")
             if not ok:
                 failures.append(f"score {mode} {got['id']}")
@@ -212,7 +250,9 @@ def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, fa
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/cleanroom-transformer")
-    parser.add_argument("--tokenizer", type=Path, help="pinned tokenizer.json (with chat_template.jinja beside it)")
+    parser.add_argument("--tokenizer", type=Path, help="pinned Qwen3.5 tokenizer.json (chat template beside it)")
+    parser.add_argument("--llama-tokenizer", type=Path,
+                        help="Llama 3 Instruct tokenizer.json (tokenizer_config.json with the chat template beside it)")
     parser.add_argument("--rows", type=Path, default=ROOT / "examples/decisions.jsonl")
     args = parser.parse_args()
     failures: list[str] = []
@@ -225,6 +265,11 @@ def main() -> None:
             check_tokenizer(args.binary, work, args.tokenizer, failures)
             print("row parity vs semif_phase1 prompt encoding + PyTorch:")
             check_rows(args.binary, work, args.tokenizer, args.rows, failures)
+        if args.llama_tokenizer:
+            print("Llama 3 tokenizer parity vs HF tokenizers:")
+            check_tokenizer(args.binary, work, args.llama_tokenizer, failures)
+            print("Llama 3 row parity vs semif_phase1 prompt encoding + PyTorch:")
+            check_rows(args.binary, work, args.llama_tokenizer, args.rows, failures, build_llama(12, 3), "llama")
     if failures:
         raise SystemExit("FAILED: " + "; ".join(failures))
     print("all parity checks passed")

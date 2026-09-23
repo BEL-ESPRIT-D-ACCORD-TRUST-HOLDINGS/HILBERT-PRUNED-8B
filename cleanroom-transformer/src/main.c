@@ -140,7 +140,8 @@ static int parse_ids(const char *s, uint32_t **ids, size_t *n) {
 
 static int cmd_prompt(const args_t *a) {
     tokenizer_t *t;
-    if (!a->input || load_tokenizer(a->model, &t)) return -1;
+    chat_format_t fmt;
+    if (!a->input || chat_format_load(a->model, &fmt) || load_tokenizer(a->model, &t)) return -1;
     arena_t ar;
     arena_init(&ar, 1 << 20);
     jval **rows;
@@ -149,7 +150,7 @@ static int cmd_prompt(const args_t *a) {
     for (size_t r = 0; r < n && !rc; r++) {
         decision_t d;
         encoded_t e;
-        if (decision_validate(rows[r], &d) || decision_encode(t, &d, a->max_tokens, &e)) {
+        if (decision_validate(rows[r], &d) || decision_encode(t, &fmt, &d, a->max_tokens, &e)) {
             printf("ERR %s\n", last_error());
             continue;
         }
@@ -251,7 +252,7 @@ static int open_engine(const args_t *a, engine_t *e, model_t *m) {
     memset(e, 0, sizeof *e);
     if (!a->revision || !a->revision[0])
         return set_error("--revision is required: pass the exact checkpoint revision string");
-    if (load_tokenizer(a->model, &e->tok)) return -1;
+    if (chat_format_load(a->model, &e->fmt) || load_tokenizer(a->model, &e->tok)) return -1;
     if (model_load(a->model, m)) {
         tokenizer_free(e->tok);
         return -1;

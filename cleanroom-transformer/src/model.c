@@ -30,6 +30,33 @@ static bool flag(const jval *obj, const char *key, bool dflt) {
     return v->type == J_TRUE;
 }
 
+static bool num_in(const jval *obj, const char *key, double *out) { return num_of(json_get(obj, key), out); }
+
+/* rope_parameters (transformers 5) or rope_scaling (older configs); theta may sit at the top level. */
+static int load_rope(const jval *cfg, config_t *c, double *partial) {
+    const jval *rope = json_get(cfg, "rope_parameters");
+    if (!rope || rope->type != J_OBJECT) rope = json_get(cfg, "rope_scaling");
+    if (rope && rope->type != J_OBJECT) rope = NULL;
+    double theta = 10000.0;
+    if (!(rope && num_in(rope, "rope_theta", &theta))) num_in(cfg, "rope_theta", &theta);
+    if (!(rope && num_in(rope, "partial_rotary_factor", partial))) num_in(cfg, "partial_rotary_factor", partial);
+    c->rope_theta = (float)theta;
+    const jval *rtype = rope ? json_get(rope, "rope_type") : NULL;
+    if (!rtype && rope) rtype = json_get(rope, "type");
+    if (!rtype || (json_is_str(rtype) && !strcmp(rtype->u.str, "default"))) return 0;
+    if (json_is_str(rtype) && !strcmp(rtype->u.str, "llama3")) {
+        double f, lo, hi, ctx;
+        if (!num_in(rope, "factor", &f) || !num_in(rope, "low_freq_factor", &lo) ||
+            !num_in(rope, "high_freq_factor", &hi) || !num_in(rope, "original_max_position_embeddings", &ctx))
+            return set_error("config: incomplete llama3 rope scaling");
+        c->rope_llama3 = true;
+        c->rope_factor = (float)f, c->rope_low_freq = (float)lo, c->rope_high_freq = (float)hi;
+        c->rope_orig_ctx = (float)ctx;
+        return 0;
+    }
+    return set_error("config: rope_type %s is not supported", json_is_str(rtype) ? rtype->u.str : "?");
+}
+
 int config_load(const char *dir, config_t *c) {
     memset(c, 0, sizeof *c);
     char path[4096];
@@ -45,8 +72,11 @@ int config_load(const char *dir, config_t *c) {
     const jval *tc = json_get(root, "text_config");
     const jval *cfg = tc && tc->type == J_OBJECT ? tc : root;
     const jval *mt = json_get(cfg, "model_type");
-    if (!json_is_str(mt) || (strcmp(mt->u.str, "qwen3_5_text") && strcmp(mt->u.str, "qwen3_5"))) {
-        set_error("config: model_type must be qwen3_5_text (got %s)", json_is_str(mt) ? mt->u.str : "none");
+    const char *type = json_is_str(mt) ? mt->u.str : "none";
+    if (!strcmp(type, "qwen3_5_text") || !strcmp(type, "qwen3_5")) c->arch = ARCH_QWEN35;
+    else if (!strcmp(type, "llama")) c->arch = ARCH_LLAMA;
+    else {
+        set_error("config: model_type %s is not supported (qwen3_5_text or llama)", type);
         goto done;
     }
     const jval *act = json_get(cfg, "hidden_act");
@@ -56,43 +86,52 @@ int config_load(const char *dir, config_t *c) {
     }
     if (need_u32(cfg, "hidden_size", &c->hidden) || need_u32(cfg, "num_hidden_layers", &c->n_layers) ||
         need_u32(cfg, "intermediate_size", &c->intermediate) || need_u32(cfg, "vocab_size", &c->vocab) ||
-        need_u32(cfg, "num_attention_heads", &c->n_heads) ||
-        need_u32(cfg, "num_key_value_heads", &c->n_kv_heads) ||
-        need_u32(cfg, "linear_num_key_heads", &c->lin_k_heads) ||
+        need_u32(cfg, "num_attention_heads", &c->n_heads) || need_u32(cfg, "num_key_value_heads", &c->n_kv_heads))
+        goto done;
+    if (json_get(cfg, "head_dim") && json_get(cfg, "head_dim")->type != J_NULL) {
+        if (need_u32(cfg, "head_dim", &c->head_dim)) goto done;
+    } else {
+        c->head_dim = c->hidden / c->n_heads;
+    }
+    double eps = 1e-6, partial = 1.0;
+    num_in(cfg, "rms_norm_eps", &eps);
+    c->eps = (float)eps;
+    if (load_rope(cfg, c, &partial)) goto done;
+    c->rot_dim = (uint32_t)(c->head_dim * partial) & ~1u;
+    c->tied = flag(cfg, "tie_word_embeddings", flag(root, "tie_word_embeddings", false));
+    if (c->n_layers > 256 || c->n_heads % c->n_kv_heads || c->rot_dim > c->head_dim || c->rot_dim == 0) {
+        set_error("config: unsupported head layout");
+        goto done;
+    }
+
+    if (c->arch == ARCH_LLAMA) {
+        /* Llama: every layer is full attention; plain RMSNorm; no q/k norm or output gate. */
+        if (flag(cfg, "attention_bias", false) || flag(cfg, "mlp_bias", false)) {
+            set_error("config: Llama checkpoints with attention or MLP biases are not supported");
+            goto done;
+        }
+        c->norm_offset = 0.0f;
+        c->qk_norm = c->attn_gate = false;
+        for (uint32_t l = 0; l < c->n_layers; l++) c->layer_type[l] = LAYER_FULL;
+        c->n_full = c->n_layers;
+        rc = 0;
+        goto done;
+    }
+
+    /* Qwen3.5: hybrid Gated DeltaNet / gated attention; zero-centred RMSNorm. */
+    if (need_u32(cfg, "linear_num_key_heads", &c->lin_k_heads) ||
         need_u32(cfg, "linear_num_value_heads", &c->lin_v_heads) ||
         need_u32(cfg, "linear_key_head_dim", &c->lin_k_dim) ||
         need_u32(cfg, "linear_value_head_dim", &c->lin_v_dim) ||
         need_u32(cfg, "linear_conv_kernel_dim", &c->conv_k))
         goto done;
-    if (json_get(cfg, "head_dim")) {
-        if (need_u32(cfg, "head_dim", &c->head_dim)) goto done;
-    } else {
-        c->head_dim = c->hidden / c->n_heads;
-    }
-    double eps = 1e-6, theta = 10000.0, partial = 1.0;
-    num_of(json_get(cfg, "rms_norm_eps"), &eps);
-    const jval *rope = json_get(cfg, "rope_parameters");
-    if (!rope) rope = json_get(cfg, "rope_scaling");
-    const jval *src = rope && rope->type == J_OBJECT ? rope : cfg;
-    if (!num_of(json_get(src, "rope_theta"), &theta)) num_of(json_get(cfg, "rope_theta"), &theta);
-    if (!num_of(json_get(src, "partial_rotary_factor"), &partial))
-        num_of(json_get(cfg, "partial_rotary_factor"), &partial);
-    const jval *rtype = json_get(src, "rope_type");
-    if (json_is_str(rtype) && strcmp(rtype->u.str, "default")) {
-        set_error("config: rope_type %s is not supported", rtype->u.str);
+    if (c->rope_llama3 || c->lin_v_heads % c->lin_k_heads) {
+        set_error("config: unsupported Qwen3.5 layout");
         goto done;
     }
-    c->eps = (float)eps;
-    c->rope_theta = (float)theta;
-    c->rot_dim = (uint32_t)(c->head_dim * partial);
-    c->rot_dim &= ~1u;
+    c->norm_offset = 1.0f;
+    c->qk_norm = true;
     c->attn_gate = flag(cfg, "attn_output_gate", true);
-    c->tied = flag(cfg, "tie_word_embeddings", flag(root, "tie_word_embeddings", false));
-    if (c->n_layers > 256 || c->n_heads % c->n_kv_heads || c->lin_v_heads % c->lin_k_heads ||
-        c->rot_dim > c->head_dim || c->rot_dim == 0) {
-        set_error("config: unsupported head layout");
-        goto done;
-    }
     const jval *types = json_get(cfg, "layer_types");
     uint32_t interval = 4;
     if (json_get(cfg, "full_attention_interval") && need_u32(cfg, "full_attention_interval", &interval)) goto done;
@@ -213,9 +252,10 @@ int model_load(const char *dir, model_t *m) {
             if (bind_mat(&b, &L->q, qrows, H, "layers.%d.self_attn.q_proj.weight", i) ||
                 bind_mat(&b, &L->k, c->n_kv_heads * hd, H, "layers.%d.self_attn.k_proj.weight", i) ||
                 bind_mat(&b, &L->v, c->n_kv_heads * hd, H, "layers.%d.self_attn.v_proj.weight", i) ||
-                bind_mat(&b, &L->o, H, c->n_heads * hd, "layers.%d.self_attn.o_proj.weight", i) ||
-                bind_vec(&b, &L->q_norm, hd, "layers.%d.self_attn.q_norm.weight", i) ||
-                bind_vec(&b, &L->k_norm, hd, "layers.%d.self_attn.k_norm.weight", i))
+                bind_mat(&b, &L->o, H, c->n_heads * hd, "layers.%d.self_attn.o_proj.weight", i))
+                goto fail;
+            if (c->qk_norm && (bind_vec(&b, &L->q_norm, hd, "layers.%d.self_attn.q_norm.weight", i) ||
+                               bind_vec(&b, &L->k_norm, hd, "layers.%d.self_attn.k_norm.weight", i)))
                 goto fail;
         } else {
             L->slot = n_lin++;
@@ -232,8 +272,23 @@ int model_load(const char *dir, model_t *m) {
         }
     }
     m->rope_inv_freq = xmalloc(c->rot_dim / 2 * sizeof(float));
-    for (uint32_t k = 0; k < c->rot_dim / 2; k++)
-        m->rope_inv_freq[k] = 1.0f / powf(c->rope_theta, (float)(2 * k) / (float)c->rot_dim); /* float32, as torch */
+    for (uint32_t k = 0; k < c->rot_dim / 2; k++) {
+        float f = 1.0f / powf(c->rope_theta, (float)(2 * k) / (float)c->rot_dim); /* float32, as torch */
+        if (c->rope_llama3) {
+            /* Llama 3.1 scaling: long wavelengths are divided by `factor`, short ones kept,
+             * and the band between is interpolated (SPEC.md 4.5). */
+            const float pi = 3.14159265358979323846f;
+            float wavelen = 2.0f * pi / f;
+            float low_wavelen = c->rope_orig_ctx / c->rope_low_freq, high_wavelen = c->rope_orig_ctx / c->rope_high_freq;
+            float scaled = wavelen > low_wavelen ? f / c->rope_factor : f;
+            if (!(wavelen < high_wavelen) && !(wavelen > low_wavelen)) {
+                float smooth = (c->rope_orig_ctx / wavelen - c->rope_low_freq) / (c->rope_high_freq - c->rope_low_freq);
+                scaled = (1.0f - smooth) * scaled / c->rope_factor + smooth * scaled;
+            }
+            f = scaled;
+        }
+        m->rope_inv_freq[k] = f;
+    }
     return 0;
 fail:
     model_free(m);
