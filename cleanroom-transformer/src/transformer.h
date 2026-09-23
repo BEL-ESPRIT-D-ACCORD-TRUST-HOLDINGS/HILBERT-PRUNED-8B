@@ -215,6 +215,18 @@ typedef struct {
     char source[512];
 } model_t;
 
+/* One per-layer weight matrix W [rows = out, cols = in]: activation `input` [T, cols]
+ * times W^T gives activation `output` [T, rows]. Shared by model_load() and the shape export. */
+typedef struct {
+    const char *name; /* tensor name after "layers.{i}." */
+    uint32_t rows, cols;
+    const char *input, *output;
+} weight_shape_t;
+
+int layer_weights(const config_t *c, uint32_t type, weight_shape_t *w, int cap);
+/* JSON description of every matrix multiply, activation width and reshape (see formal/). */
+void shapes_json(const config_t *c, sbuf_t *out);
+
 int config_load(const char *dir, config_t *cfg);
 int model_load(const char *dir, model_t *m);
 void model_free(model_t *m);

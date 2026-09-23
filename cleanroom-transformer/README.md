@@ -24,6 +24,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | Tokenizer | Verified. Matches the Hugging Face tokenizer on 423 test strings, including Unicode edge cases |
 | CPU forward pass | Verified. Matches PyTorch to within 7e-6 on small random checkpoints, and within 0.1 logits on the real model compared with the committed GPU results |
 | Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
+| Shape contract | Proven with Alloy. Every matrix multiply in the real Qwen3.5-4B and Llama 3 8B forward passes is a valid siphon in `formal/FreehandTensorSiphon.als`, and the head-sharing, RoPE and conv-split rules hold in bounded proofs (see Formal checks) |
 | CUDA forward pass | Compiles for sm_86 with no warnings. **Not yet run on a GPU.** Run `selftest` (below) before relying on it |
 
 ## Build
@@ -141,6 +142,8 @@ calibrated confidence.
 | `src/cuda_backend.cu` | GPU forward pass and `selftest` |
 | `src/engine.c` | Scoring, including shared-context scoring |
 | `src/http.c` | HTTP server |
+| `src/shapes.c` | Per-layer weight table, and the shape export for formal checks |
+| `formal/` | Alloy models of the shape contract |
 
 ## Testing
 
@@ -150,6 +153,41 @@ python tools/check_prompts.py --model qwen35-4b      # prompts vs committed resu
 python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
   --llama-tokenizer llama3-8b-instruct/tokenizer.json         # vs PyTorch (needs torch, transformers)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
+```
+
+## Formal checks
+
+`formal/` holds two Alloy models:
+
+- **`FreehandTensorSiphon.als`** is the matrix-multiplication shape model:
+  inner dimensions must agree, the outer dimensions survive, and the shared
+  one is consumed.
+- **`TransformerShapes.als`** proves, over every configuration within its
+  integer bound, the index rules the kernels rely on:
+  - each query head reads an in-range KV head, and each KV head serves
+    exactly `nh / nkv` query heads, which are consecutive;
+  - the same rules for DeltaNet value and key heads;
+  - RoPE's half-split pairing is an involution;
+  - the conv output splits exactly into q, k and v.
+
+`make formal` connects these to the engine:
+
+1. `cleanroom-transformer shapes` exports the engine's weight table (the same
+   table the loader binds weights from), the activation widths the kernels
+   produce, and the per-head contractions.
+2. `tools/check_formal.py` turns each export into an Alloy instance of
+   `FreehandTensorSiphon`. Each width becomes one dimension atom, and each
+   multiply becomes a `Product`.
+3. Alloy then checks that every product is a `MatmulSiphon`.
+
+Alloy integers cannot reach real model widths, so reshapes (splitting a
+projection into heads) are checked with ordinary arithmetic. A mutation test
+confirms that a single wrong dimension produces a counterexample. The checks
+run on the committed configs in `tests/configs/`, or on any `--model` folder.
+
+```bash
+make formal                           # downloads the pinned Alloy 6.2.0 jar (checksum-verified)
+make formal ALLOY_JAR=/path/to/alloy.jar
 ```
 
 ## Limitations

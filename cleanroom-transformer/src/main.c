@@ -20,6 +20,7 @@ static void usage(void) {
             "  tokenize  token ids of stdin, or of each JSON string line in --input\n"
             "  logits    raw logits               --tokens \"1 2 3\" --ids \"4 5\" [--split N]\n"
             "  selftest  check CUDA kernels against the CPU reference  [--tokens N]\n"
+            "  shapes    print every matrix multiply and activation width as JSON (config.json only)\n"
             "\n"
             "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n");
 }
@@ -332,6 +333,16 @@ static int cmd_serve(const args_t *a) {
     return rc;
 }
 
+static int cmd_shapes(const args_t *a) {
+    config_t c;
+    if (config_load(a->model, &c)) return -1;
+    sbuf_t b = {0};
+    shapes_json(&c, &b);
+    fputs(b.data, stdout);
+    sb_free(&b);
+    return 0;
+}
+
 static int cmd_selftest(const args_t *a) {
 #ifdef USE_CUDA
     model_t m;
@@ -358,6 +369,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a.cmd, "tokenize")) rc = cmd_tokenize(&a);
     else if (!strcmp(a.cmd, "logits")) rc = cmd_logits(&a);
     else if (!strcmp(a.cmd, "selftest")) rc = cmd_selftest(&a);
+    else if (!strcmp(a.cmd, "shapes")) rc = cmd_shapes(&a);
     else {
         usage();
         return 2;
