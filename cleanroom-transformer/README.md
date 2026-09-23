@@ -1,7 +1,7 @@
 # Clean Room Transformer
 
-A self-contained inference engine for the Qwen3.5-4B language model. It is
-written in C11, and its CUDA backend targets NVIDIA Ampere GPUs (compute
+A self-contained inference engine for Qwen3.5-4B and Llama 3 8B Instruct. It
+is written in C11, and its CUDA backend targets NVIDIA Ampere GPUs (compute
 capability 8.6, for example the RTX 3090).
 
 The engine answers multiple-choice questions about a piece of text. You give
@@ -23,6 +23,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | Prompt construction and tokenization | Verified. All 1,029 committed benchmark rows produce the same prompt hash, token count and answer tokens as the Python implementation |
 | Tokenizer | Verified. Matches the Hugging Face tokenizer on 423 test strings, including Unicode edge cases |
 | CPU forward pass | Verified. Matches PyTorch to within 7e-6 on small random checkpoints, and within 0.1 logits on the real model compared with the committed GPU results |
+| Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
 | CUDA forward pass | Compiles for sm_86 with no warnings. **Not yet run on a GPU.** Run `selftest` (below) before relying on it |
 
 ## Build
@@ -76,6 +77,31 @@ curl -s localhost:8086/healthz
 `POST /v1/decide` accepts one row, or `{"rows": [...]}` to score several rows
 that share context.
 
+### Llama 3 8B
+
+Point `--model` at a folder in Hugging Face format. It needs `config.json`,
+`tokenizer.json`, `tokenizer_config.json` (with the chat template) and the
+`.safetensors` weights:
+
+```bash
+build/cleanroom-transformer-cuda selftest --model llama3-8b-hf-fp16
+build/cleanroom-transformer-cuda score --model llama3-8b-hf-fp16 --revision <your-label> \
+  --input ../examples/decisions.jsonl --output llama-results.jsonl
+```
+
+- **Instruct only.** Base Llama 3 has no chat template, so it cannot be
+  prompted this way. The Python scorer refuses it for the same reason.
+- **Memory.** The 8B model needs about 17 GB of GPU memory: 16 GB of
+  weights plus the attention cache. That fits a 24 GB RTX 3090.
+- **FP16 weights** are converted to BF16 on the GPU, which rounds the weights
+  slightly. The CPU backend uses them unchanged.
+- **Weights converted from GGUF** keep the precision of the GGUF you started
+  from. A conversion must also undo llama.cpp's reordering of the query and
+  key weights. If it doesn't, the output is wrong, and `selftest` cannot
+  catch it, because the CPU and GPU would agree with each other. To
+  cross-check, score a few rows with the Python scorer's llama.cpp backend on
+  the original GGUF and compare the chosen answers.
+
 ### Input and output
 
 Each input row is one JSON object:
@@ -101,6 +127,7 @@ calibrated confidence.
    `tokenizer.json`.
 3. **Run the model.** Qwen3.5-4B has 32 layers: 24 linear-attention layers
    (Gated DeltaNet) and 8 standard attention layers with an output gate.
+   Llama 3 8B has 32 standard attention layers.
 4. **Read the answer.** Read the logits for the answer letters A-P at the
    last position and apply a softmax.
 
@@ -120,7 +147,8 @@ calibrated confidence.
 ```bash
 make test                                            # unit tests
 python tools/check_prompts.py --model qwen35-4b      # prompts vs committed results
-python tools/parity.py --tokenizer qwen35-4b/tokenizer.json   # vs PyTorch (needs torch, transformers)
+python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
+  --llama-tokenizer llama3-8b-instruct/tokenizer.json         # vs PyTorch (needs torch, transformers)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
 ```
 
@@ -130,7 +158,9 @@ TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of th
 - Shared-context mode scores rows one after another, not in parallel.
 - GPU kernels favour accuracy over peak speed. There is no pipelined matrix
   multiply, and the attention cache is float32.
-- Text only. The model's vision components are not loaded.
+- Text only. Qwen3.5's vision components are not loaded.
+- Supported chat templates: Qwen3.5 and Llama 3 Instruct. The Llama 3.1
+  template is not supported yet, but Llama 3.1-style RoPE scaling is.
 - The HTTP server handles one request at a time.
 
 ## Provenance

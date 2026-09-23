@@ -111,7 +111,8 @@ static void test_rows(void) {
     decision_t d;
     CHECK(!json_parse(&a, good, strlen(good), &v) && !decision_validate(v, &d), "valid row: %s", last_error());
     sbuf_t p = {0};
-    decision_prompt(&d, &p);
+    chat_format_t qwen = {CHAT_QWEN35, ""};
+    decision_prompt(&d, &qwen, &p);
     const char *want =
         "<|im_start|>system\nApply the supplied criterion to the supplied evidence. Choose exactly one listed "
         "option. Respond with only its uppercase letter, with no explanation or reasoning.<|im_end|>\n"

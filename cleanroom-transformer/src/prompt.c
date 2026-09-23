@@ -1,8 +1,9 @@
-/* prompt.c - SemIf direct-options-v1 rows, prompt text and answer slots.
+/* prompt.c - direct-options-v1 decision rows, prompt text and answer slots.
  * Implements SPEC.md sections 1-3 (row rules, prompt bytes, slot checks). */
 #include "transformer.h"
 
 #include <math.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -68,10 +69,68 @@ int decision_validate(const jval *row, decision_t *d) {
     return 0;
 }
 
-void decision_prompt(const decision_t *d, sbuf_t *out) {
-    sb_puts(out, "<|im_start|>system\n");
-    sb_puts(out, SYSTEM);
-    sb_puts(out, "<|im_end|>\n<|im_start|>user\n");
+/* ---------------------------------------------------------- chat formats */
+static bool has(const char *s, size_t n, const char *needle) {
+    size_t k = strlen(needle);
+    for (size_t i = 0; i + k <= n; i++)
+        if (!memcmp(s + i, needle, k)) return true;
+    return false;
+}
+
+int chat_format_load(const char *dir, chat_format_t *out) {
+    memset(out, 0, sizeof *out);
+    char path[4096], *text = NULL, *cfg_text = NULL;
+    size_t len = 0, cfg_len = 0;
+    arena_t a;
+    arena_init(&a, 1 << 16);
+    const char *tmpl = NULL;
+    size_t tmpl_len = 0;
+    jval *cfg = NULL;
+    snprintf(path, sizeof path, "%s/tokenizer_config.json", dir);
+    if (read_file(path, &cfg_text, &cfg_len) == 0 && json_parse(&a, cfg_text, cfg_len, &cfg)) cfg = NULL;
+    snprintf(path, sizeof path, "%s/chat_template.jinja", dir);
+    if (read_file(path, &text, &len) == 0) {
+        tmpl = text, tmpl_len = len;
+    } else {
+        const jval *ct = json_get(cfg, "chat_template");
+        if (json_is_str(ct)) tmpl = ct->u.str, tmpl_len = ct->n;
+    }
+    int rc = 0;
+    if (!tmpl) {
+        rc = set_error("%s has no chat template (chat_template.jinja or tokenizer_config.json); "
+                       "base models without one cannot be prompted", dir);
+    } else if (has(tmpl, tmpl_len, "<|im_start|>") && has(tmpl, tmpl_len, "enable_thinking")) {
+        out->kind = CHAT_QWEN35;
+    } else if (has(tmpl, tmpl_len, "<|start_header_id|>") && has(tmpl, tmpl_len, "<|eot_id|>") &&
+               !has(tmpl, tmpl_len, "Cutting Knowledge") && !has(tmpl, tmpl_len, "tools")) {
+        out->kind = CHAT_LLAMA3;
+        const jval *bos = json_get(cfg, "bos_token");
+        if (bos && bos->type == J_OBJECT) bos = json_get(bos, "content");
+        if (has(tmpl, tmpl_len, "bos_token")) {
+            if (!json_is_str(bos) || bos->n >= sizeof out->bos)
+                rc = set_error("%s: the chat template uses bos_token but tokenizer_config.json has none", dir);
+            else memcpy(out->bos, bos->u.str, bos->n);
+        }
+    } else {
+        rc = set_error("%s: unsupported chat template (supported: Qwen3.5 and Llama 3 Instruct)", dir);
+    }
+    arena_free(&a);
+    free(text);
+    free(cfg_text);
+    return rc;
+}
+
+void decision_prompt(const decision_t *d, const chat_format_t *fmt, sbuf_t *out) {
+    if (fmt->kind == CHAT_LLAMA3) {
+        sb_puts(out, fmt->bos);
+        sb_puts(out, "<|start_header_id|>system<|end_header_id|>\n\n");
+        sb_puts(out, SYSTEM);
+        sb_puts(out, "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n");
+    } else {
+        sb_puts(out, "<|im_start|>system\n");
+        sb_puts(out, SYSTEM);
+        sb_puts(out, "<|im_end|>\n<|im_start|>user\n");
+    }
     sb_puts(out, "{\"evidence\": ");
     json_dump_py(out, json_get(d->row, "state"));
     sb_puts(out, ", \"criterion\": ");
@@ -84,7 +143,10 @@ void decision_prompt(const decision_t *d, sbuf_t *out) {
         json_dump_str(out, desc->u.str, desc->n);
         sb_putc(out, '}');
     }
-    sb_puts(out, "]}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    if (fmt->kind == CHAT_LLAMA3)
+        sb_puts(out, "]}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n");
+    else
+        sb_puts(out, "]}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
 }
 
 void encoded_free(encoded_t *e) {
@@ -93,10 +155,11 @@ void encoded_free(encoded_t *e) {
     e->n = 0;
 }
 
-int decision_encode(const tokenizer_t *t, const decision_t *d, size_t max_tokens, encoded_t *out) {
+int decision_encode(const tokenizer_t *t, const chat_format_t *fmt, const decision_t *d, size_t max_tokens,
+                    encoded_t *out) {
     memset(out, 0, sizeof *out);
     sbuf_t prompt = {0};
-    decision_prompt(d, &prompt);
+    decision_prompt(d, fmt, &prompt);
     sha256_hex(prompt.data, prompt.len, out->sha256);
     size_t cap = 0;
     int rc = -1;

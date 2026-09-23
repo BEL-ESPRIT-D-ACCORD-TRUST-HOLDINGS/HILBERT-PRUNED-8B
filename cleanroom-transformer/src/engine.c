@@ -67,7 +67,7 @@ int engine_score_direct(engine_t *e, const jval *row, sbuf_t *out) {
     double started = now_seconds();
     decision_t d;
     encoded_t enc;
-    if (decision_validate(row, &d) || decision_encode(e->tok, &d, e->max_tokens, &enc)) return -1;
+    if (decision_validate(row, &d) || decision_encode(e->tok, &e->fmt, &d, e->max_tokens, &enc)) return -1;
     float logits[MAX_OPTIONS];
     double mark = now_seconds();
     int rc = e->be->reset(e->be);
@@ -91,7 +91,7 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
         for (size_t j = 0; j < r && !rc; j++)
             if (d[j].id_len == d[r].id_len && memcmp(d[j].id, d[r].id, d[r].id_len) == 0)
                 rc = set_error("Decision IDs must be unique (%.*s)", (int)d[r].id_len, d[r].id);
-        if (!rc) rc = decision_encode(e->tok, &d[r], e->max_tokens, &enc[r]);
+        if (!rc) rc = decision_encode(e->tok, &e->fmt, &d[r], e->max_tokens, &enc[r]);
         if (!rc) encoded++;
     }
     size_t prefix = 0;

@@ -1,4 +1,4 @@
-// cuda_backend.cu - Qwen3.5 hybrid decoder forward pass for sm_86 (RTX 30xx / A-series Ampere).
+// cuda_backend.cu - decoder forward pass for sm_86 (RTX 30xx / A-series Ampere): Qwen3.5 hybrid and Llama.
 //
 // Mirrors cpu_backend.c (SPEC.md 4) kernel for kernel:
 //   - weights live on the device as bf16; activations are float32;
@@ -64,16 +64,16 @@ __global__ void k_embed(const bf16 *E, const uint32_t *tok, float *x, int H) {
     for (int d = threadIdx.x; d < H; d += blockDim.x) x[(size_t)t * H + d] = __bfloat162float(row[d]);
 }
 
-// out = rms(x) * (1 + w), one block per row
+// out = rms(x) * (off + w), one block per row (off = 1 for zero-centred norms, 0 for plain RMSNorm)
 template <typename OUT>
-__global__ void k_norm1p(const float *x, const float *w, OUT *out, int H, float eps) {
+__global__ void k_rmsnorm(const float *x, const float *w, float off, OUT *out, int H, float eps) {
     const float *r = x + (size_t)blockIdx.x * H;
     float ss = 0.f;
     for (int d = threadIdx.x; d < H; d += blockDim.x) ss += r[d] * r[d];
     ss = block_sum(ss);
     float inv = 1.0f / sqrtf(ss / (float)H + eps);
     for (int d = threadIdx.x; d < H; d += blockDim.x) {
-        float y = r[d] * inv * (1.0f + w[d]);
+        float y = r[d] * inv * (off + w[d]);
         if constexpr (sizeof(OUT) == 2) out[(size_t)blockIdx.x * H + d] = to_bf16(y);
         else out[(size_t)blockIdx.x * H + d] = y;
     }
@@ -202,11 +202,11 @@ static int gemm(const bf16 *A, const bf16 *W, float *C, int M, int N, int K, boo
 }
 
 // ---- gated attention
-// Per (token, head): N1p over head_dim, then RoPE on the first rot dims. Query heads read from the
+// Per (token, head): optional RMSNorm over head_dim (qw/kw null = none), then RoPE on the first rot dims. Query heads read from the
 // [q | gate] interleaved projection and go to qo; KV heads go to the cache at absolute positions.
 __global__ void k_qk_norm_rope(const float *qg, const float *k, const float *v, const float *qw, const float *kw,
-                               const float *inv_freq, float *qo, float *kc, float *vc, int nh, int nkv, int hd,
-                               int rot, int qstride, int pos0, float eps) {
+                               float off, const float *inv_freq, float *qo, float *kc, float *vc, int nh, int nkv,
+                               int hd, int rot, int qstride, int pos0, float eps) {
     extern __shared__ float xs[];
     const int t = blockIdx.x, j = blockIdx.y;
     const bool isq = j < nh;
@@ -219,8 +219,10 @@ __global__ void k_qk_norm_rope(const float *qg, const float *k, const float *v, 
         ss += x * x;
     }
     ss = block_sum(ss);
-    float inv = 1.0f / sqrtf(ss / (float)hd + eps);
-    for (int d = threadIdx.x; d < hd; d += blockDim.x) xs[d] = xs[d] * inv * (1.0f + w[d]);
+    if (w) {
+        float inv = 1.0f / sqrtf(ss / (float)hd + eps);
+        for (int d = threadIdx.x; d < hd; d += blockDim.x) xs[d] = xs[d] * inv * (off + w[d]);
+    }
     __syncthreads();
     const int half = rot / 2;
     const float p = (float)(pos0 + t);
@@ -558,7 +560,7 @@ static int run_layers(cuda_t *c, int T, int pos0) {
     cudaStream_t st = c->st;
     for (uint32_t li = 0; li < cfg->n_layers; li++) {
         const dlayer_t *L = &c->L[li];
-        k_norm1p<bf16><<<T, 256, 0, st>>>(c->x, L->in_norm, c->hb, H, cfg->eps);
+        k_rmsnorm<bf16><<<T, 256, 0, st>>>(c->x, L->in_norm, cfg->norm_offset, c->hb, H, cfg->eps);
         CKL();
         if (L->type == LAYER_FULL) {
             // f0 = [q|gate], f1 = roped q then v, f2 = k, hb = gated attention output
@@ -567,7 +569,7 @@ static int run_layers(cuda_t *c, int T, int pos0) {
             float *vbuf = c->f1 + (size_t)T * nh * hd;  // v staged after q
             if (gemm(c->hb, L->v, vbuf, T, kvw, H, false, 0, st)) return -1;
             dim3 g2(T, nh + nkv);
-            k_qk_norm_rope<<<g2, 128, hd * sizeof(float), st>>>(c->f0, c->f2, vbuf, L->q_norm, L->k_norm, c->inv_freq,
+            k_qk_norm_rope<<<g2, 128, hd * sizeof(float), st>>>(c->f0, c->f2, vbuf, L->q_norm, L->k_norm, cfg->norm_offset, c->inv_freq,
                                                               c->f1, c->kc[L->slot], c->vc[L->slot], nh, nkv, hd,
                                                               (int)cfg->rot_dim, qw, pos0, cfg->eps);
             CKL();
@@ -599,7 +601,7 @@ static int run_layers(cuda_t *c, int T, int pos0) {
             CKL();
             if (gemm(c->hb, L->out, c->x, T, H, Dv, true, 0, st)) return -1;
         }
-        k_norm1p<bf16><<<T, 256, 0, st>>>(c->x, L->post_norm, c->hb, H, cfg->eps);
+        k_rmsnorm<bf16><<<T, 256, 0, st>>>(c->x, L->post_norm, cfg->norm_offset, c->hb, H, cfg->eps);
         CKL();
         if (gemm(c->hb, L->gate, c->f0, T, I, H, false, 0, st) || gemm(c->hb, L->up, c->f1, T, I, H, false, 0, st))
             return -1;
@@ -633,7 +635,8 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
         b->pos += (size_t)T;
         last_T = T;
     }
-    k_norm1p<float><<<1, 256, 0, c->st>>>(c->x + (size_t)(last_T - 1) * H, c->final_norm, c->hfin, H, cfg->eps);
+    k_rmsnorm<float><<<1, 256, 0, c->st>>>(c->x + (size_t)(last_T - 1) * H, c->final_norm, cfg->norm_offset, c->hfin, H,
+                                           cfg->eps);
     CKL();
     if (n_ids) {
         CK(cudaMemcpyAsync(c->d_ids, ids, n_ids * sizeof(uint32_t), cudaMemcpyHostToDevice, c->st));
@@ -685,8 +688,9 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
             return -1;
         if (s->type == LAYER_FULL) {
             if (upload_mat(c, &d->q, &s->q) || upload_mat(c, &d->k, &s->k) || upload_mat(c, &d->v, &s->v) ||
-                upload_mat(c, &d->o, &s->o) || upload_vec(c, &d->q_norm, s->q_norm, hd) ||
-                upload_vec(c, &d->k_norm, s->k_norm, hd))
+                upload_mat(c, &d->o, &s->o))
+                return -1;
+            if (cfg->qk_norm && (upload_vec(c, &d->q_norm, s->q_norm, hd) || upload_vec(c, &d->k_norm, s->k_norm, hd)))
                 return -1;
         } else {
             if (upload_mat(c, &d->qkv, &s->qkv) || upload_mat(c, &d->z, &s->z) || upload_mat(c, &d->b, &s->b) ||
