@@ -9,7 +9,7 @@
  * uploads are refused.
  */
 #define _POSIX_C_SOURCE 200809L
-#include "semif86.h"
+#include "transformer.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -157,13 +157,13 @@ static void handle(engine_t *e, int fd, size_t max_body) {
     jval *root;
     sbuf_t out = {0};
     if (json_parse(&a, body, (size_t)want, &root)) {
-        respond_error(fd, 400, "Bad Request", semif_error());
+        respond_error(fd, 400, "Bad Request", last_error());
     } else {
         const jval *rows = json_get(root, "rows");
         int rc;
         if (rows) {
             if (rows->type != J_ARRAY || rows->n == 0) {
-                rc = semif_fail("rows must be a nonempty array");
+                rc = set_error("rows must be a nonempty array");
             } else {
                 sbuf_t lines = {0};
                 rc = engine_score_shared(e, (const jval *const *)rows->u.items, rows->n, &lines);
@@ -185,7 +185,7 @@ static void handle(engine_t *e, int fd, size_t max_body) {
             rc = engine_score_direct(e, root, &out);
             if (!rc) sb_putc(&out, '\n');
         }
-        if (rc) respond_error(fd, 400, "Bad Request", semif_error());
+        if (rc) respond_error(fd, 400, "Bad Request", last_error());
         else respond(fd, 200, "OK", out.data, out.len);
     }
     sb_free(&out);
@@ -202,24 +202,24 @@ int http_serve(engine_t *e, const char *host, int port, size_t max_body) {
     char portstr[16];
     snprintf(portstr, sizeof portstr, "%d", port);
     int gai = getaddrinfo(host, portstr, &hints, &ai);
-    if (gai) return semif_fail("cannot resolve %s: %s", host, gai_strerror(gai));
+    if (gai) return set_error("cannot resolve %s: %s", host, gai_strerror(gai));
     int fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
     int one = 1;
     if (fd < 0 || setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) ||
         bind(fd, ai->ai_addr, ai->ai_addrlen) || listen(fd, 16)) {
         freeaddrinfo(ai);
         if (fd >= 0) close(fd);
-        return semif_fail("cannot listen on %s:%d: %s", host, port, strerror(errno));
+        return set_error("cannot listen on %s:%d: %s", host, port, strerror(errno));
     }
     freeaddrinfo(ai);
-    fprintf(stderr, "semif86: serving %s on http://%s:%d (POST /v1/decide, GET /healthz)\n", e->be->name, host,
+    fprintf(stderr, "cleanroom-transformer: serving %s on http://%s:%d (POST /v1/decide, GET /healthz)\n", e->be->name, host,
             port);
     for (;;) {
         int c = accept(fd, NULL, NULL);
         if (c < 0) {
             if (errno == EINTR) continue;
             close(fd);
-            return semif_fail("accept failed: %s", strerror(errno));
+            return set_error("accept failed: %s", strerror(errno));
         }
         struct timeval tv = {30, 0};
         setsockopt(c, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof tv);

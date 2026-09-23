@@ -1,7 +1,7 @@
 /* ops_common.h - scalar math shared by the CPU reference and the CUDA kernels,
  * so both backends evaluate the same formulas (SPEC.md section 4). */
-#ifndef SEMIF86_OPS_COMMON_H
-#define SEMIF86_OPS_COMMON_H
+#ifndef OPS_COMMON_H
+#define OPS_COMMON_H
 
 #include <math.h>
 #include <stdint.h>

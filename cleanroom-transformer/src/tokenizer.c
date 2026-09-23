@@ -1,6 +1,6 @@
 /* tokenizer.c - byte-level BPE loaded from a Hugging Face tokenizer.json.
  * Implements SPEC.md section 3. */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -102,7 +102,7 @@ static int merge_token_ids(tokenizer_t *t, const char *a, size_t na, const char 
     memcpy(ab + na, b, nb);
     const vslot_t *vab = vocab_find(t, ab, na + nb);
     if (ab != stack) free(ab);
-    if (!va || !vb || !vab) return semif_fail("tokenizer: merge %u refers to unknown tokens", rank);
+    if (!va || !vb || !vab) return set_error("tokenizer: merge %u refers to unknown tokens", rank);
     uint64_t key = (uint64_t)va->id << 32 | vb->id;
     size_t h = mix(key) & (t->merges_cap - 1);
     while (t->merges[h].pair != UINT64_MAX) {
@@ -127,23 +127,23 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
     const jval *model = json_get(root, "model");
     const jval *type = json_get(model, "type");
     if (!json_is_str(type) || strcmp(type->u.str, "BPE") != 0) {
-        semif_fail("tokenizer: only BPE models are supported");
+        set_error("tokenizer: only BPE models are supported");
         goto done;
     }
     const jval *bf = json_get(model, "byte_fallback");
     if (bf && bf->type == J_TRUE) {
-        semif_fail("tokenizer: byte_fallback BPE is not supported");
+        set_error("tokenizer: byte_fallback BPE is not supported");
         goto done;
     }
     const jval *norm = json_get(root, "normalizer");
     const jval *ntype = json_get(norm, "type");
     if (norm && norm->type != J_NULL && (!json_is_str(ntype) || strcmp(ntype->u.str, "NFC") != 0)) {
-        semif_fail("tokenizer: only the NFC normalizer is supported");
+        set_error("tokenizer: only the NFC normalizer is supported");
         goto done;
     }
     const jval *vocab = json_get(model, "vocab"), *merges = json_get(model, "merges");
     if (!vocab || vocab->type != J_OBJECT || !merges || merges->type != J_ARRAY) {
-        semif_fail("tokenizer: missing model.vocab or model.merges");
+        set_error("tokenizer: missing model.vocab or model.merges");
         goto done;
     }
     t->vocab_cap = pow2_at_least((size_t)vocab->n * 2);
@@ -151,7 +151,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
     for (uint32_t k = 0; k < vocab->n; k++) {
         const jval *idv = vocab->u.obj.vals[k];
         if (idv->type != J_INT || idv->u.str[0] == '-') {
-            semif_fail("tokenizer: bad vocab id");
+            set_error("tokenizer: bad vocab id");
             goto done;
         }
         uint32_t id = (uint32_t)strtoul(idv->u.str, NULL, 10);
@@ -170,7 +170,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
         if (m->type == J_STRING) {
             const char *sp = memchr(m->u.str, ' ', m->n);
             if (!sp) {
-                semif_fail("tokenizer: bad merge %u", r);
+                set_error("tokenizer: bad merge %u", r);
                 goto done;
             }
             size_t na = (size_t)(sp - m->u.str);
@@ -181,7 +181,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
                                 m->u.items[1]->n, r))
                 goto done;
         } else {
-            semif_fail("tokenizer: bad merge %u", r);
+            set_error("tokenizer: bad merge %u", r);
             goto done;
         }
     }
@@ -190,7 +190,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
         int n = utf8_encode(byte_char(b), u);
         const vslot_t *v = vocab_find(t, u, (size_t)n);
         if (!v) {
-            semif_fail("tokenizer: byte 0x%02X has no base token", b);
+            set_error("tokenizer: byte 0x%02X has no base token", b);
             goto done;
         }
         t->byte_id[b] = v->id;
@@ -202,12 +202,12 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
             const jval *a = added->u.items[k], *content = json_get(a, "content"), *id = json_get(a, "id");
             const jval *normalized = json_get(a, "normalized");
             if (!json_is_str(content) || !id || id->type != J_INT || content->n == 0) {
-                semif_fail("tokenizer: bad added token %u", k);
+                set_error("tokenizer: bad added token %u", k);
                 goto done;
             }
             if (normalized && normalized->type == J_TRUE) {
                 /* Pinned tokenizers never set this; refuse rather than guess. */
-                semif_fail("tokenizer: normalized added tokens are not supported");
+                set_error("tokenizer: normalized added tokens are not supported");
                 goto done;
             }
             char *s = arena_strndup(&t->arena, content->u.str, content->n);
@@ -443,7 +443,7 @@ static void encode_segment(const tokenizer_t *t, const char *seg, size_t seg_len
 
 int tokenizer_encode(const tokenizer_t *t, const char *text, size_t len, uint32_t **ids, size_t *n,
                      size_t *cap) {
-    if (!utf8_valid(text, len)) return semif_fail("tokenizer: input is not valid UTF-8");
+    if (!utf8_valid(text, len)) return set_error("tokenizer: input is not valid UTF-8");
     out_t o = {ids, n, cap};
     size_t before = *n, seg = 0, i = 0;
     while (i < len) {

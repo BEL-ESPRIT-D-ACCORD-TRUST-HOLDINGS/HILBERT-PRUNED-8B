@@ -1,10 +1,10 @@
-/* semif86.h - internal interfaces of the semif86 decision engine.
+/* transformer.h - internal interfaces of the cleanroom-transformer decision engine.
  *
  * C11 host code plus an optional CUDA backend built for sm_86. See SPEC.md
  * for the contract every function here implements.
  */
-#ifndef SEMIF86_H
-#define SEMIF86_H
+#ifndef TRANSFORMER_H
+#define TRANSFORMER_H
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -16,9 +16,9 @@ extern "C" {
 
 /* ------------------------------------------------------------------ errors */
 /* Every fallible function returns 0 on success or -1 after recording a
- * message that semif_error() returns. The engine is single threaded. */
-int semif_fail(const char *fmt, ...);
-const char *semif_error(void);
+ * message that last_error() returns. The engine is single threaded. */
+int set_error(const char *fmt, ...);
+const char *last_error(void);
 
 /* ------------------------------------------------------------------ memory */
 typedef struct arena_block arena_block;
@@ -107,15 +107,15 @@ const char *tokenizer_piece(const tokenizer_t *t, uint32_t id, size_t *len);
 uint32_t tokenizer_vocab_size(const tokenizer_t *t);
 
 /* ------------------------------------------------------------------ prompt */
-#define SEMIF_MAX_OPTIONS 16
-#define SEMIF_PROMPT_VERSION "direct-options-v1"
+#define MAX_OPTIONS 16
+#define PROMPT_VERSION "direct-options-v1"
 
 typedef struct {
     const jval *row;
     const char *id;
     size_t id_len;
     uint32_t n_options;
-    const jval *options[SEMIF_MAX_OPTIONS];
+    const jval *options[MAX_OPTIONS];
 } decision_t;
 
 int decision_validate(const jval *row, decision_t *out);
@@ -124,7 +124,7 @@ void decision_prompt(const decision_t *d, sbuf_t *out);
 typedef struct {
     uint32_t *ids;
     size_t n;
-    uint32_t slots[SEMIF_MAX_OPTIONS];
+    uint32_t slots[MAX_OPTIONS];
     char sha256[65];
 } encoded_t;
 
@@ -220,7 +220,7 @@ struct backend {
 };
 
 backend_t *cpu_backend_create(const model_t *m, size_t max_seq);
-#ifdef SEMIF_CUDA
+#ifdef USE_CUDA
 backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device);
 int cuda_selftest(const model_t *m, int device, size_t n_tokens, int verbose);
 #endif

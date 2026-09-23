@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Check semif86 prompt bytes against predictions committed from the Python/RTX 3090 runs.
+"""Check cleanroom-transformer prompt bytes against predictions committed from the Python/RTX 3090 runs.
 
-For every committed benchmark row, `semif86 prompt` must reproduce the recorded
+For every committed benchmark row, `cleanroom-transformer prompt` must reproduce the recorded
 prompt_sha256, input_tokens and answer-slot token ids. Needs only the pinned
 tokenizer.json (no weights).
 
@@ -24,7 +24,7 @@ PAIRS = [
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--model", required=True, help="directory holding the pinned tokenizer.json")
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/semif86")
+    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/cleanroom-transformer")
     args = parser.parse_args()
     failed = 0
     for rows_path, preds_path in PAIRS:

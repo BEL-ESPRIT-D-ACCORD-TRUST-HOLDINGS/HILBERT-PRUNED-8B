@@ -1,5 +1,5 @@
 /* sha256.c - FIPS 180-4 SHA-256. */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <string.h>
 

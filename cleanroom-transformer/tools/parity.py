@@ -1,20 +1,20 @@
 #!/usr/bin/env python3
-"""Black-box parity between semif86 and the Hugging Face reference.
+"""Compare the engine against the Hugging Face / PyTorch reference.
 
 Builds tiny random Qwen3.5 text checkpoints with transformers, then checks:
 
   1. tokenizer ids against HF `tokenizers` on a fixed corpus plus 400 random
      strings, and prompt bytes, token ids and answer slots against
      semif_phase1.direct (both need the pinned tokenizer.json);
-  2. last-position option logits of `semif86 logits` against PyTorch float32,
+  2. last-position option logits of `cleanroom-transformer logits` against PyTorch float32,
      for float32 and bfloat16 weights, single- and multi-shard layouts, both
      weight-name prefixes, and prefix snapshot/restore (--split);
-  3. `semif86 score` direct and shared rows against a PyTorch rerun of
+  3. `cleanroom-transformer score` direct and shared rows against a PyTorch rerun of
      SemIf's own prompt encoding.
 
 Needs: torch (CPU is fine), transformers==5.17.0, safetensors.
 
-    python tools/parity.py --binary build/semif86 --tokenizer /path/to/tokenizer.json
+    python tools/parity.py --binary build/cleanroom-transformer --tokenizer /path/to/tokenizer.json
 """
 from __future__ import annotations
 
@@ -118,7 +118,7 @@ def reference_logits(model, tokens, ids, dtype):
 def run(binary: Path, *args: str) -> str:
     done = subprocess.run([str(binary), *args], capture_output=True, text=True)
     if done.returncode:
-        raise SystemExit(f"semif86 {' '.join(args[:1])} failed: {done.stderr.strip()}")
+        raise SystemExit(f"cleanroom-transformer {' '.join(args[:1])} failed: {done.stderr.strip()}")
     return done.stdout
 
 
@@ -211,7 +211,7 @@ def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, fa
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/semif86")
+    parser.add_argument("--binary", type=Path, default=Path(__file__).resolve().parents[1] / "build/cleanroom-transformer")
     parser.add_argument("--tokenizer", type=Path, help="pinned tokenizer.json (with chat_template.jinja beside it)")
     parser.add_argument("--rows", type=Path, default=ROOT / "examples/decisions.jsonl")
     args = parser.parse_args()

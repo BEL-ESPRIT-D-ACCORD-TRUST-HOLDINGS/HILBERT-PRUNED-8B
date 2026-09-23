@@ -1,6 +1,6 @@
-/* main.c - semif86 command line. */
+/* main.c - cleanroom-transformer command line. */
 #define _POSIX_C_SOURCE 200809L
-#include "semif86.h"
+#include "transformer.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -10,15 +10,18 @@
 
 static void usage(void) {
     fprintf(stderr,
-            "usage:\n"
-            "  semif86 score  --model DIR --revision REV --input rows.jsonl --output results.jsonl\n"
-            "                 [--mode direct|shared] [--backend cpu|cuda] [--device N] [--max-tokens N]\n"
-            "  semif86 serve  --model DIR --revision REV [--host 127.0.0.1] [--port 8086]\n"
-            "                 [--backend cpu|cuda] [--device N] [--max-tokens N] [--max-body BYTES]\n"
-            "  semif86 prompt --model DIR --input rows.jsonl      (sha256, token count, slots; no weights)\n"
-            "  semif86 tokenize --model DIR [--input strings.jsonl] < text   (token ids)\n"
-            "  semif86 logits --model DIR --tokens \"1 2 3\" --ids \"4 5\" [--split N] [--backend cpu|cuda]\n"
-            "  semif86 selftest --model DIR [--tokens N]          (CUDA kernels vs CPU reference)\n");
+            "usage: cleanroom-transformer COMMAND --model DIR [options]\n"
+            "\n"
+            "commands:\n"
+            "  score     score decision rows      --revision REV --input rows.jsonl --output results.jsonl\n"
+            "                                     [--mode direct|shared]\n"
+            "  serve     HTTP server              --revision REV [--host 127.0.0.1] [--port 8086] [--max-body BYTES]\n"
+            "  prompt    prompt hash, token count and answer tokens per row (no weights needed)  --input rows.jsonl\n"
+            "  tokenize  token ids of stdin, or of each JSON string line in --input\n"
+            "  logits    raw logits               --tokens \"1 2 3\" --ids \"4 5\" [--split N]\n"
+            "  selftest  check CUDA kernels against the CPU reference  [--tokens N]\n"
+            "\n"
+            "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n");
 }
 
 typedef struct {
@@ -30,7 +33,7 @@ typedef struct {
 static int parse_args(int argc, char **argv, args_t *a) {
     memset(a, 0, sizeof *a);
     a->mode = "direct";
-#ifdef SEMIF_CUDA
+#ifdef USE_CUDA
     a->backend = "cuda";
 #else
     a->backend = "cpu";
@@ -75,10 +78,10 @@ static int load_tokenizer(const char *dir, tokenizer_t **t) {
 
 static backend_t *make_backend(const args_t *a, const model_t *m) {
     if (!strcmp(a->backend, "cpu")) return cpu_backend_create(m, a->max_tokens);
-#ifdef SEMIF_CUDA
+#ifdef USE_CUDA
     if (!strcmp(a->backend, "cuda")) return cuda_backend_create(m, a->max_tokens, a->device);
 #endif
-    semif_fail("backend %s is not available in this build", a->backend);
+    set_error("backend %s is not available in this build", a->backend);
     return NULL;
 }
 
@@ -100,7 +103,7 @@ static int read_rows(arena_t *ar, const char *path, jval ***rows, size_t *n) {
         if (!blank) {
             jval *v;
             if (json_parse(ar, p, (size_t)(end - p), &v)) {
-                rc = semif_fail("%s:%zu: %s", path, line_no, semif_error());
+                rc = set_error("%s:%zu: %s", path, line_no, last_error());
                 break;
             }
             if (*n == cap) {
@@ -112,7 +115,7 @@ static int read_rows(arena_t *ar, const char *path, jval ***rows, size_t *n) {
         p = end + 1;
     }
     free(text);
-    if (!rc && *n == 0) rc = semif_fail("Input is empty");
+    if (!rc && *n == 0) rc = set_error("Input is empty");
     return rc;
 }
 
@@ -124,7 +127,7 @@ static int parse_ids(const char *s, uint32_t **ids, size_t *n) {
         while (*s == ' ' || *s == ',') s++;
         if (!*s) break;
         unsigned long v = strtoul(s, &end, 10);
-        if (end == s) return semif_fail("bad id list");
+        if (end == s) return set_error("bad id list");
         if (*n == cap) {
             cap = cap ? cap * 2 : 64;
             *ids = xrealloc(*ids, cap * sizeof **ids);
@@ -147,7 +150,7 @@ static int cmd_prompt(const args_t *a) {
         decision_t d;
         encoded_t e;
         if (decision_validate(rows[r], &d) || decision_encode(t, &d, a->max_tokens, &e)) {
-            printf("ERR %s\n", semif_error());
+            printf("ERR %s\n", last_error());
             continue;
         }
         printf("%s %zu", e.sha256, e.n);
@@ -172,7 +175,7 @@ static int tokenize_lines(const tokenizer_t *t, const char *path) {
     size_t cap = 0;
     for (size_t r = 0; r < n && !rc; r++) {
         size_t m = 0;
-        if (rows[r]->type != J_STRING) rc = semif_fail("%s: line %zu is not a JSON string", path, r + 1);
+        if (rows[r]->type != J_STRING) rc = set_error("%s: line %zu is not a JSON string", path, r + 1);
         else if (tokenizer_encode(t, rows[r]->u.str, rows[r]->n, &ids, &m, &cap) < 0) rc = -1;
         for (size_t k = 0; k < m && !rc; k++) printf("%s%u", k ? " " : "", ids[k]);
         if (!rc) printf("\n");
@@ -213,7 +216,7 @@ static int cmd_logits(const args_t *a) {
     size_t nt, ni;
     if (parse_ids(a->tokens, &toks, &nt) || parse_ids(a->ids, &ids, &ni) || nt == 0) {
         model_free(&m);
-        return semif_fail("--tokens and --ids need id lists");
+        return set_error("--tokens and --ids need id lists");
     }
     backend_t *be = make_backend(a, &m);
     int rc = be ? 0 : -1;
@@ -247,7 +250,7 @@ static int cmd_logits(const args_t *a) {
 static int open_engine(const args_t *a, engine_t *e, model_t *m) {
     memset(e, 0, sizeof *e);
     if (!a->revision || !a->revision[0])
-        return semif_fail("--revision is required: pass the exact checkpoint revision string");
+        return set_error("--revision is required: pass the exact checkpoint revision string");
     if (load_tokenizer(a->model, &e->tok)) return -1;
     if (model_load(a->model, m)) {
         tokenizer_free(e->tok);
@@ -272,8 +275,8 @@ static void close_engine(engine_t *e) {
 }
 
 static int cmd_score(const args_t *a) {
-    if (!a->input || !a->output) return semif_fail("--input and --output are required");
-    if (strcmp(a->mode, "direct") && strcmp(a->mode, "shared")) return semif_fail("--mode must be direct or shared");
+    if (!a->input || !a->output) return set_error("--input and --output are required");
+    if (strcmp(a->mode, "direct") && strcmp(a->mode, "shared")) return set_error("--mode must be direct or shared");
     arena_t ar;
     arena_init(&ar, 1 << 20);
     jval **rows;
@@ -286,7 +289,7 @@ static int cmd_score(const args_t *a) {
     int fd = -1;
     if (!rc) {
         fd = open(a->output, O_WRONLY | O_CREAT | O_EXCL, 0644); /* create-only, like semif-score */
-        if (fd < 0) rc = semif_fail("Output must be new: cannot create %s", a->output);
+        if (fd < 0) rc = set_error("Output must be new: cannot create %s", a->output);
     }
     engine_t e;
     model_t m;
@@ -310,7 +313,7 @@ static int cmd_score(const args_t *a) {
             }
         }
         sb_free(&b);
-        if (fclose(out) && !rc) rc = semif_fail("cannot write %s", a->output);
+        if (fclose(out) && !rc) rc = set_error("cannot write %s", a->output);
         close_engine(&e);
     }
     if (fd >= 0) close(fd);
@@ -329,7 +332,7 @@ static int cmd_serve(const args_t *a) {
 }
 
 static int cmd_selftest(const args_t *a) {
-#ifdef SEMIF_CUDA
+#ifdef USE_CUDA
     model_t m;
     if (model_load(a->model, &m)) return -1;
     int rc = cuda_selftest(&m, a->device, a->n_selftest, 1);
@@ -337,7 +340,7 @@ static int cmd_selftest(const args_t *a) {
     return rc;
 #else
     (void)a;
-    return semif_fail("selftest needs a CUDA build (make cuda)");
+    return set_error("selftest needs a CUDA build (make cuda)");
 #endif
 }
 
@@ -359,7 +362,7 @@ int main(int argc, char **argv) {
         return 2;
     }
     if (rc) {
-        fprintf(stderr, "semif86: %s\n", semif_error());
+        fprintf(stderr, "cleanroom-transformer: %s\n", last_error());
         return 1;
     }
     return 0;

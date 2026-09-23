@@ -1,7 +1,7 @@
-# semif86 - SemIf decision engine, C11 host + CUDA for sm_86.
+# Clean Room Transformer: C11 host code, plus a CUDA backend for sm_86 (Ampere).
 #
-#   make            CPU reference build        -> build/semif86
-#   make cuda       CUDA build for sm_86       -> build/semif86-cuda
+#   make            CPU reference build        -> build/cleanroom-transformer
+#   make cuda       CUDA build for sm_86       -> build/cleanroom-transformer-cuda
 #   make test       unit tests (no model needed)
 #   make cuda-check compile the CUDA code for sm_86 without linking a binary
 
@@ -20,35 +20,35 @@ HOST_SRC := src/base.c src/json.c src/sha256.c src/unicode.c src/tokenizer.c src
 BUILD := build
 
 .PHONY: all cuda cuda-check test clean
-all: $(BUILD)/semif86
+all: $(BUILD)/cleanroom-transformer
 
-$(BUILD)/cpu/%.o: src/%.c src/semif86.h src/ops_common.h src/unicode_tables.h
+$(BUILD)/cpu/%.o: src/%.c src/transformer.h src/ops_common.h src/unicode_tables.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(OMP) -c $< -o $@
 
-$(BUILD)/semif86: $(patsubst src/%.c,$(BUILD)/cpu/%.o,$(HOST_SRC) src/main.c)
+$(BUILD)/cleanroom-transformer: $(patsubst src/%.c,$(BUILD)/cpu/%.o,$(HOST_SRC) src/main.c)
 	$(CC) $(CFLAGS) $(OMP) $^ -o $@ $(LDLIBS)
 
 # ------------------------------------------------------------------ CUDA
-$(BUILD)/gpu/%.o: src/%.c src/semif86.h src/ops_common.h src/unicode_tables.h
+$(BUILD)/gpu/%.o: src/%.c src/transformer.h src/ops_common.h src/unicode_tables.h
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) $(OMP) -DSEMIF_CUDA -c $< -o $@
+	$(CC) $(CFLAGS) $(OMP) -DUSE_CUDA -c $< -o $@
 
-$(BUILD)/gpu/cuda_backend.o: src/cuda_backend.cu src/semif86.h src/ops_common.h
+$(BUILD)/gpu/cuda_backend.o: src/cuda_backend.cu src/transformer.h src/ops_common.h
 	@mkdir -p $(dir $@)
-	$(NVCC) -std=c++17 -O3 $(CUDA_ARCH) -Isrc -DSEMIF_CUDA -Xcompiler -Wall -c $< -o $@
+	$(NVCC) -std=c++17 -O3 $(CUDA_ARCH) -Isrc -DUSE_CUDA -Xcompiler -Wall -c $< -o $@
 
-$(BUILD)/semif86-cuda: $(patsubst src/%.c,$(BUILD)/gpu/%.o,$(HOST_SRC) src/main.c) $(BUILD)/gpu/cuda_backend.o
+$(BUILD)/cleanroom-transformer-cuda: $(patsubst src/%.c,$(BUILD)/gpu/%.o,$(HOST_SRC) src/main.c) $(BUILD)/gpu/cuda_backend.o
 	$(NVCC) $(CUDA_ARCH) -Xcompiler $(OMP) $^ -o $@ -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib -lcudart -lm
 
-cuda: $(BUILD)/semif86-cuda
+cuda: $(BUILD)/cleanroom-transformer-cuda
 cuda-check: $(BUILD)/gpu/cuda_backend.o
 
 # ------------------------------------------------------------------ tests
 $(BUILD)/test_unit: tests/test_unit.c $(patsubst src/%.c,$(BUILD)/cpu/%.o,$(HOST_SRC))
 	$(CC) $(CFLAGS) $(OMP) $^ -o $@ $(LDLIBS)
 
-test: $(BUILD)/test_unit $(BUILD)/semif86
+test: $(BUILD)/test_unit $(BUILD)/cleanroom-transformer
 	$(BUILD)/test_unit
 
 clean:

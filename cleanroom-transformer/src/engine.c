@@ -1,5 +1,5 @@
 /* engine.c - decision scoring and SemIf-compatible result rows (SPEC.md 4.3, 5). */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -18,7 +18,7 @@ static void model_meta(const engine_t *e, sbuf_t *out, const char *serving) {
     json_dump_str(out, e->model->source, strlen(e->model->source));
     sb_puts(out, ", \"revision\": ");
     json_dump_str(out, e->revision, strlen(e->revision));
-    sb_puts(out, ", \"engine\": \"semif86\", \"backend\": ");
+    sb_puts(out, ", \"engine\": \"cleanroom-transformer\", \"backend\": ");
     json_dump_str(out, e->be->name, strlen(e->be->name));
     if (serving) sb_printf(out, ", \"serving_config\": \"%s\"", serving);
     sb_putc(out, '}');
@@ -26,9 +26,9 @@ static void model_meta(const engine_t *e, sbuf_t *out, const char *serving) {
 
 static int write_result(const engine_t *e, const decision_t *d, const encoded_t *enc, const float *logits,
                         double forward_s, double total_s, const char *serving, sbuf_t *out) {
-    double p[SEMIF_MAX_OPTIONS];
+    double p[MAX_OPTIONS];
     for (uint32_t k = 0; k < d->n_options; k++)
-        if (!isfinite(logits[k])) return semif_fail("Row %.*s: non-finite option logit", (int)d->id_len, d->id);
+        if (!isfinite(logits[k])) return set_error("Row %.*s: non-finite option logit", (int)d->id_len, d->id);
     softmax_d(logits, d->n_options, p);
     sb_puts(out, "{\"id\": ");
     json_dump_str(out, d->id, d->id_len);
@@ -56,7 +56,7 @@ static int write_result(const engine_t *e, const decision_t *d, const encoded_t 
         json_dump_double(out, total_s);
     }
     sb_printf(out, ", \"prompt_sha256\": \"%s\", \"prompt_version\": \"%s\", \"model\": ", enc->sha256,
-              SEMIF_PROMPT_VERSION);
+              PROMPT_VERSION);
     model_meta(e, out, serving);
     sb_puts(out, ", \"readout\": \"native last-position logits restricted to declared answer slots\""
                  ", \"probability_status\": \"conditional option score; uncalibrated as decision confidence\"}");
@@ -68,7 +68,7 @@ int engine_score_direct(engine_t *e, const jval *row, sbuf_t *out) {
     decision_t d;
     encoded_t enc;
     if (decision_validate(row, &d) || decision_encode(e->tok, &d, e->max_tokens, &enc)) return -1;
-    float logits[SEMIF_MAX_OPTIONS];
+    float logits[MAX_OPTIONS];
     double mark = now_seconds();
     int rc = e->be->reset(e->be);
     if (!rc) rc = e->be->forward(e->be, enc.ids, enc.n, enc.slots, d.n_options, logits);
@@ -79,18 +79,18 @@ int engine_score_direct(engine_t *e, const jval *row, sbuf_t *out) {
 }
 
 int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *out) {
-    if (n == 0) return semif_fail("no rows");
+    if (n == 0) return set_error("no rows");
     double started = now_seconds();
     decision_t *d = xcalloc(n, sizeof *d);
     encoded_t *enc = xcalloc(n, sizeof *enc);
-    float *logits = xcalloc(n * SEMIF_MAX_OPTIONS, sizeof *logits);
+    float *logits = xcalloc(n * MAX_OPTIONS, sizeof *logits);
     int rc = 0;
     size_t encoded = 0;
     for (size_t r = 0; r < n && !rc; r++) {
         rc = decision_validate(rows[r], &d[r]);
         for (size_t j = 0; j < r && !rc; j++)
             if (d[j].id_len == d[r].id_len && memcmp(d[j].id, d[r].id, d[r].id_len) == 0)
-                rc = semif_fail("Decision IDs must be unique (%.*s)", (int)d[r].id_len, d[r].id);
+                rc = set_error("Decision IDs must be unique (%.*s)", (int)d[r].id_len, d[r].id);
         if (!rc) rc = decision_encode(e->tok, &d[r], e->max_tokens, &enc[r]);
         if (!rc) encoded++;
     }
@@ -114,7 +114,7 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
             rc = e->be->restore(e->be);
             if (!rc)
                 rc = e->be->forward(e->be, enc[r].ids + prefix, enc[r].n - prefix, enc[r].slots, d[r].n_options,
-                                    logits + r * SEMIF_MAX_OPTIONS);
+                                    logits + r * MAX_OPTIONS);
         }
         suffix_s = now_seconds() - mark;
     }
@@ -133,7 +133,7 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
         sb_printf(&timing, ", \"batch_size\": %zu, \"true_suffix_tokens\": %zu}", n, true_suffix);
         for (size_t r = 0; r < n && !rc; r++) {
             size_t mark = out->len;
-            rc = write_result(e, &d[r], &enc[r], logits + r * SEMIF_MAX_OPTIONS, -1, -1,
+            rc = write_result(e, &d[r], &enc[r], logits + r * MAX_OPTIONS, -1, -1,
                               "shared-token-prefix-serial-v1", out);
             if (!rc) {
                 out->len--; /* reopen the object to append the batch timing */

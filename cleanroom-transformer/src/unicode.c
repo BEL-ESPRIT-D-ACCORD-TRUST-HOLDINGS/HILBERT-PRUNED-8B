@@ -1,5 +1,5 @@
 /* unicode.c - UTF-8, general-category classes, White_Space, and NFC. */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <stdlib.h>
 #include <string.h>

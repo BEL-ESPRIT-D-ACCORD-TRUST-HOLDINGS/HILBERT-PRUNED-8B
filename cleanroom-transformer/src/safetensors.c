@@ -1,6 +1,6 @@
 /* safetensors.c - read-only mmap loader for (sharded) safetensors checkpoints. */
 #define _POSIX_C_SOURCE 200809L
-#include "semif86.h"
+#include "transformer.h"
 
 #include <fcntl.h>
 #include <stdio.h>
@@ -25,15 +25,15 @@ static int dtype_of(const char *s, dtype_t *dt, size_t *elem) {
 
 static int open_file(const char *path, st_set_t *set) {
     int fd = open(path, O_RDONLY);
-    if (fd < 0) return semif_fail("cannot open %s", path);
+    if (fd < 0) return set_error("cannot open %s", path);
     struct stat sb;
     if (fstat(fd, &sb) || sb.st_size < 8) {
         close(fd);
-        return semif_fail("%s is not a safetensors file", path);
+        return set_error("%s is not a safetensors file", path);
     }
     void *map = mmap(NULL, (size_t)sb.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
     close(fd);
-    if (map == MAP_FAILED) return semif_fail("cannot mmap %s", path);
+    if (map == MAP_FAILED) return set_error("cannot mmap %s", path);
     st_file_t *f = xmalloc(sizeof *f);
     f->map = map;
     f->size = (size_t)sb.st_size;
@@ -43,13 +43,13 @@ static int open_file(const char *path, st_set_t *set) {
     const unsigned char *p = map;
     uint64_t hlen = 0;
     for (int k = 7; k >= 0; k--) hlen = hlen << 8 | p[k];
-    if (hlen > f->size - 8) return semif_fail("%s: bad header length", path);
+    if (hlen > f->size - 8) return set_error("%s: bad header length", path);
     arena_t a;
     arena_init(&a, 1 << 20);
     jval *h;
     if (json_parse(&a, (const char *)p + 8, (size_t)hlen, &h) || h->type != J_OBJECT) {
         arena_free(&a);
-        return semif_fail("%s: bad header", path);
+        return set_error("%s: bad header", path);
     }
     const unsigned char *data = p + 8 + hlen;
     size_t data_size = f->size - 8 - (size_t)hlen;
@@ -66,7 +66,7 @@ static int open_file(const char *path, st_set_t *set) {
             continue;
         }
         if (!shape || shape->type != J_ARRAY || shape->n > 8 || !off || off->type != J_ARRAY || off->n != 2) {
-            rc = semif_fail("%s: bad entry %s", path, name);
+            rc = set_error("%s: bad entry %s", path, name);
             break;
         }
         uint64_t count = 1;
@@ -77,7 +77,7 @@ static int open_file(const char *path, st_set_t *set) {
         }
         uint64_t b = strtoull(off->u.items[0]->u.str, NULL, 10), e = strtoull(off->u.items[1]->u.str, NULL, 10);
         if (e < b || e > data_size || e - b != count * elem) {
-            rc = semif_fail("%s: bad offsets for %s", path, name);
+            rc = set_error("%s: bad offsets for %s", path, name);
             break;
         }
         x.name = xmalloc(h->u.obj.key_lens[k] + 1);
@@ -104,13 +104,13 @@ int st_open_dir(const char *dir, st_set_t *out) {
         int rc = json_parse(&a, text, len, &root);
         const jval *map = rc ? NULL : json_get(root, "weight_map");
         if (!map || map->type != J_OBJECT) {
-            rc = semif_fail("%s: missing weight_map", path);
+            rc = set_error("%s: missing weight_map", path);
         } else {
             /* Open each distinct shard once, in first-seen order. */
             for (uint32_t k = 0; k < map->n && !rc; k++) {
                 const jval *file = map->u.obj.vals[k];
                 if (!json_is_str(file) || strchr(file->u.str, '/')) {
-                    rc = semif_fail("%s: bad shard name", path);
+                    rc = set_error("%s: bad shard name", path);
                     break;
                 }
                 bool seen = false;

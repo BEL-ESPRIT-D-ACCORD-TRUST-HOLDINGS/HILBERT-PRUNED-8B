@@ -1,22 +1,19 @@
-# semif86 engine specification
+# Specification
 
-This is the contract `semif86` implements. It was written before the engine
-code, from four kinds of source:
+This document defines what the Clean Room Transformer computes. It was
+written before the code, and the code is checked against it.
 
-- the pinned model's public `config.json`, `tokenizer.json`,
-  `chat_template.jinja` and safetensors index
-  (`Qwen/Qwen3.5-4B@851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`);
-- this repository's Python decision contract (`src/semif_phase1/core.py`,
-  `direct.py`, `shared.py`), which the engine must reproduce byte for byte;
-- the published math for gated DeltaNet and gated attention;
-- a reading of the Apache-2.0 `transformers` Qwen3.5 module. That reading
-  settled details the config leaves open: the zero-centred norm, the
-  query/gate interleave, the conv and head order, and the epsilons. Its
-  numeric output on tiny random checkpoints is the oracle in
-  `tools/parity.py`.
+Sources:
 
-No source from the other consolidated repositories is copied into the engine.
-Their roles are re-implemented from this document (see README, "Provenance").
+- The public files of the pinned model, `Qwen/Qwen3.5-4B` at revision
+  `851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a`: `config.json`,
+  `tokenizer.json`, `chat_template.jinja` and the weight index.
+- This repository's Python decision format (`src/semif_phase1/`). The engine
+  must reproduce its prompts byte for byte.
+- Published descriptions of Gated DeltaNet and gated attention.
+- A reading of the Apache-2.0 Hugging Face `transformers` Qwen3.5 module. It
+  settled details the config does not state: the norm style, the query/gate
+  layout, the head order and the epsilons.
 
 ## 1. Decision rows (`direct-options-v1`)
 

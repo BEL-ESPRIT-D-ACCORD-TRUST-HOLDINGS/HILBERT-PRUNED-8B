@@ -1,5 +1,5 @@
 /* model.c - Qwen3.5 text-decoder config and weight binding (SPEC.md 4, 4.4). */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -19,7 +19,7 @@ static bool num_of(const jval *v, double *out) {
 static int need_u32(const jval *obj, const char *key, uint32_t *out) {
     double x;
     if (!num_of(json_get(obj, key), &x) || x < 1 || x > 1e9 || x != floor(x))
-        return semif_fail("config: missing or bad %s", key);
+        return set_error("config: missing or bad %s", key);
     *out = (uint32_t)x;
     return 0;
 }
@@ -46,12 +46,12 @@ int config_load(const char *dir, config_t *c) {
     const jval *cfg = tc && tc->type == J_OBJECT ? tc : root;
     const jval *mt = json_get(cfg, "model_type");
     if (!json_is_str(mt) || (strcmp(mt->u.str, "qwen3_5_text") && strcmp(mt->u.str, "qwen3_5"))) {
-        semif_fail("config: model_type must be qwen3_5_text (got %s)", json_is_str(mt) ? mt->u.str : "none");
+        set_error("config: model_type must be qwen3_5_text (got %s)", json_is_str(mt) ? mt->u.str : "none");
         goto done;
     }
     const jval *act = json_get(cfg, "hidden_act");
     if (act && (!json_is_str(act) || strcmp(act->u.str, "silu"))) {
-        semif_fail("config: only silu activations are supported");
+        set_error("config: only silu activations are supported");
         goto done;
     }
     if (need_u32(cfg, "hidden_size", &c->hidden) || need_u32(cfg, "num_hidden_layers", &c->n_layers) ||
@@ -79,7 +79,7 @@ int config_load(const char *dir, config_t *c) {
         num_of(json_get(cfg, "partial_rotary_factor"), &partial);
     const jval *rtype = json_get(src, "rope_type");
     if (json_is_str(rtype) && strcmp(rtype->u.str, "default")) {
-        semif_fail("config: rope_type %s is not supported", rtype->u.str);
+        set_error("config: rope_type %s is not supported", rtype->u.str);
         goto done;
     }
     c->eps = (float)eps;
@@ -90,7 +90,7 @@ int config_load(const char *dir, config_t *c) {
     c->tied = flag(cfg, "tie_word_embeddings", flag(root, "tie_word_embeddings", false));
     if (c->n_layers > 256 || c->n_heads % c->n_kv_heads || c->lin_v_heads % c->lin_k_heads ||
         c->rot_dim > c->head_dim || c->rot_dim == 0) {
-        semif_fail("config: unsupported head layout");
+        set_error("config: unsupported head layout");
         goto done;
     }
     const jval *types = json_get(cfg, "layer_types");
@@ -100,14 +100,14 @@ int config_load(const char *dir, config_t *c) {
         uint8_t t = (l + 1) % interval == 0 ? LAYER_FULL : LAYER_LINEAR;
         if (types) {
             if (types->type != J_ARRAY || types->n != c->n_layers || !json_is_str(types->u.items[l])) {
-                semif_fail("config: bad layer_types");
+                set_error("config: bad layer_types");
                 goto done;
             }
             const char *s = types->u.items[l]->u.str;
             if (!strcmp(s, "full_attention")) t = LAYER_FULL;
             else if (!strcmp(s, "linear_attention")) t = LAYER_LINEAR;
             else {
-                semif_fail("config: unknown layer type %s", s);
+                set_error("config: unknown layer type %s", s);
                 goto done;
             }
         }
@@ -133,7 +133,7 @@ static const st_tensor_t *find(binder_t *b, const char *fmt, int layer) {
     snprintf(name, sizeof name, fmt, layer);
     snprintf(full, sizeof full, "%s%s", b->prefix, name);
     const st_tensor_t *t = st_find(&b->m->st, full);
-    if (!t) semif_fail("weights: missing %s", full);
+    if (!t) set_error("weights: missing %s", full);
     return t;
 }
 
@@ -141,7 +141,7 @@ static int bind_mat(binder_t *b, wmat_t *w, uint32_t rows, uint32_t cols, const 
     const st_tensor_t *t = find(b, fmt, layer);
     if (!t) return -1;
     if (t->ndim != 2 || t->shape[0] != rows || t->shape[1] != cols)
-        return semif_fail("weights: %s has shape [%llu, %llu], expected [%u, %u]", t->name,
+        return set_error("weights: %s has shape [%llu, %llu], expected [%u, %u]", t->name,
                           (unsigned long long)t->shape[0], (unsigned long long)(t->ndim > 1 ? t->shape[1] : 0),
                           rows, cols);
     *w = (wmat_t){t->dtype, rows, cols, t->data};
@@ -166,7 +166,7 @@ static int bind_vec(binder_t *b, float **v, uint64_t count, const char *fmt, int
     if (!t) return -1;
     uint64_t n = 1;
     for (uint32_t d = 0; d < t->ndim; d++) n *= t->shape[d];
-    if (n != count) return semif_fail("weights: %s has %llu values, expected %llu", t->name,
+    if (n != count) return set_error("weights: %s has %llu values, expected %llu", t->name,
                                       (unsigned long long)n, (unsigned long long)count);
     *v = to_f32(t, count);
     return 0;
@@ -187,7 +187,7 @@ int model_load(const char *dir, model_t *m) {
     } else {
         const st_tensor_t *t = st_find(&m->st, "lm_head.weight");
         if (!t || t->ndim != 2 || t->shape[0] != c->vocab || t->shape[1] != c->hidden) {
-            semif_fail("weights: missing or bad lm_head.weight");
+            set_error("weights: missing or bad lm_head.weight");
             goto fail;
         }
         m->lm_head = (wmat_t){t->dtype, c->vocab, c->hidden, t->data};

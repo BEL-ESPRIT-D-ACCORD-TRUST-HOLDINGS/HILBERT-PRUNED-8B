@@ -4,7 +4,7 @@
  * widened on the fly. This backend is the numeric reference that the CUDA
  * backend is checked against. It uses OpenMP when built with -fopenmp.
  */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <math.h>
 #include <stdlib.h>
@@ -230,12 +230,12 @@ static int cpu_forward(backend_t *b, const uint32_t *tokens, size_t T, const uin
     cpu_t *c = (cpu_t *)b;
     const model_t *m = c->m;
     const config_t *cfg = &m->cfg;
-    if (T == 0) return semif_fail("forward: no tokens");
-    if (b->pos + T > b->max_seq) return semif_fail("forward: %zu tokens exceed context %zu", b->pos + T, b->max_seq);
+    if (T == 0) return set_error("forward: no tokens");
+    if (b->pos + T > b->max_seq) return set_error("forward: %zu tokens exceed context %zu", b->pos + T, b->max_seq);
     for (size_t t = 0; t < T; t++)
-        if (tokens[t] >= cfg->vocab) return semif_fail("forward: token %u out of range", tokens[t]);
+        if (tokens[t] >= cfg->vocab) return set_error("forward: token %u out of range", tokens[t]);
     for (uint32_t k = 0; k < n_ids; k++)
-        if (ids[k] >= cfg->vocab) return semif_fail("forward: readout id %u out of range", ids[k]);
+        if (ids[k] >= cfg->vocab) return set_error("forward: readout id %u out of range", ids[k]);
     const size_t H = cfg->hidden;
     size_t mix_w = (size_t)cfg->n_heads * cfg->head_dim;
     size_t dv_all = (size_t)cfg->lin_v_heads * cfg->lin_v_dim;
@@ -287,7 +287,7 @@ static int cpu_snapshot(backend_t *b) {
 
 static int cpu_restore(backend_t *b) {
     cpu_t *c = (cpu_t *)b;
-    if (!c->has_snap) return semif_fail("restore: no snapshot");
+    if (!c->has_snap) return set_error("restore: no snapshot");
     const config_t *cfg = &c->m->cfg;
     size_t C = 2 * (size_t)cfg->lin_k_heads * cfg->lin_k_dim + (size_t)cfg->lin_v_heads * cfg->lin_v_dim;
     size_t Ssz = (size_t)cfg->lin_v_heads * cfg->lin_k_dim * cfg->lin_v_dim;

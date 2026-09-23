@@ -1,5 +1,5 @@
 /* test_unit.c - model-free checks for the host library. Run with `make test`. */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <math.h>
 #include <stdio.h>
@@ -40,7 +40,7 @@ static void roundtrip(const char *in, const char *want) {
     arena_init(&a, 0);
     jval *v;
     if (json_parse(&a, in, strlen(in), &v)) {
-        CHECK(want == NULL, "parse %s: %s", in, semif_error());
+        CHECK(want == NULL, "parse %s: %s", in, last_error());
     } else {
         sbuf_t b = {0};
         json_dump_py(&b, v);
@@ -109,7 +109,7 @@ static void test_rows(void) {
     arena_init(&a, 0);
     jval *v;
     decision_t d;
-    CHECK(!json_parse(&a, good, strlen(good), &v) && !decision_validate(v, &d), "valid row: %s", semif_error());
+    CHECK(!json_parse(&a, good, strlen(good), &v) && !decision_validate(v, &d), "valid row: %s", last_error());
     sbuf_t p = {0};
     decision_prompt(&d, &p);
     const char *want =

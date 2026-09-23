@@ -1,5 +1,5 @@
 /* json.c - strict JSON reader and a Python-compatible json.dumps writer. */
-#include "semif86.h"
+#include "transformer.h"
 
 #include <errno.h>
 #include <math.h>
@@ -17,7 +17,7 @@ typedef struct {
 } parser_t;
 
 static int perr(parser_t *p, const char *what) {
-    return semif_fail("JSON: %s at byte %zu", what, p->i);
+    return set_error("JSON: %s at byte %zu", what, p->i);
 }
 
 static void skip_ws(parser_t *p) {
@@ -384,7 +384,7 @@ static int parse_value(parser_t *p, jval **out) {
 }
 
 int json_parse(arena_t *a, const char *text, size_t len, jval **out) {
-    if (!utf8_valid(text, len)) return semif_fail("JSON: input is not valid UTF-8");
+    if (!utf8_valid(text, len)) return set_error("JSON: input is not valid UTF-8");
     parser_t p = {a, text, len, 0, 0};
     if (parse_value(&p, out)) return -1;
     skip_ws(&p);

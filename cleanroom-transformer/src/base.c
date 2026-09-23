@@ -1,6 +1,6 @@
 /* base.c - errors, arena allocation, string buffers, files, clock. */
 #define _POSIX_C_SOURCE 200809L
-#include "semif86.h"
+#include "transformer.h"
 
 #include <stdarg.h>
 #include <stdio.h>
@@ -10,7 +10,7 @@
 
 static char g_error[1024];
 
-int semif_fail(const char *fmt, ...) {
+int set_error(const char *fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
     vsnprintf(g_error, sizeof g_error, fmt, ap);
@@ -18,10 +18,10 @@ int semif_fail(const char *fmt, ...) {
     return -1;
 }
 
-const char *semif_error(void) { return g_error[0] ? g_error : "unknown error"; }
+const char *last_error(void) { return g_error[0] ? g_error : "unknown error"; }
 
 static void oom(size_t n) {
-    fprintf(stderr, "semif86: out of memory allocating %zu bytes\n", n);
+    fprintf(stderr, "cleanroom-transformer: out of memory allocating %zu bytes\n", n);
     abort();
 }
 
@@ -132,7 +132,7 @@ void sb_free(sbuf_t *b) {
 /* ------------------------------------------------------------------- misc */
 int read_file(const char *path, char **out, size_t *len) {
     FILE *f = fopen(path, "rb");
-    if (!f) return semif_fail("cannot open %s", path);
+    if (!f) return set_error("cannot open %s", path);
     sbuf_t b = {0};
     char chunk[1 << 16];
     size_t got;
@@ -141,7 +141,7 @@ int read_file(const char *path, char **out, size_t *len) {
     fclose(f);
     if (bad) {
         sb_free(&b);
-        return semif_fail("cannot read %s", path);
+        return set_error("cannot read %s", path);
     }
     if (!b.data) sb_putn(&b, "", 0);
     *out = b.data;

@@ -4,7 +4,7 @@
 //   - weights live on the device as bf16; activations are float32;
 //   - GEMM inputs are rounded to bf16 and accumulate in float32 on tensor cores (WMMA m16n16k16);
 //   - attention, gated DeltaNet recurrence, norms and gates run in float32.
-// `semif86 selftest` compares every kernel family and whole forward passes with the CPU reference.
+// `cleanroom-transformer selftest` compares every kernel family and whole forward passes with the CPU reference.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
 #include <mma.h>
@@ -15,7 +15,7 @@
 #include <string.h>
 
 #include "ops_common.h"
-#include "semif86.h"
+#include "transformer.h"
 
 using namespace nvcuda;
 typedef __nv_bfloat16 bf16;
@@ -24,7 +24,7 @@ typedef __nv_bfloat16 bf16;
     do {                                                                                            \
         cudaError_t err_ = (call);                                                                  \
         if (err_ != cudaSuccess)                                                                    \
-            return semif_fail("CUDA %s failed: %s (%s:%d)", #call, cudaGetErrorString(err_), __FILE__, \
+            return set_error("CUDA %s failed: %s (%s:%d)", #call, cudaGetErrorString(err_), __FILE__, \
                               __LINE__);                                                            \
     } while (0)
 #define CKL() CK(cudaGetLastError())
@@ -473,7 +473,7 @@ static int upload_mat(cuda_t *c, bf16 **dst, const wmat_t *w) {
         cudaError_t e = cudaMemcpy((uint16_t *)*dst + o, tmp, m * sizeof(uint16_t), cudaMemcpyHostToDevice);
         if (e != cudaSuccess) {
             free(tmp);
-            return semif_fail("CUDA upload failed: %s", cudaGetErrorString(e));
+            return set_error("CUDA upload failed: %s", cudaGetErrorString(e));
         }
     }
     free(tmp);
@@ -522,7 +522,7 @@ static int cu_snapshot(backend_t *b) {
 
 static int cu_restore(backend_t *b) {
     cuda_t *c = (cuda_t *)b;
-    if (!c->has_snap) return semif_fail("restore: no snapshot");
+    if (!c->has_snap) return set_error("restore: no snapshot");
     CK(cudaSetDevice(c->device));
     if (copy_linear_state(c, false)) return -1;
     b->pos = c->snap_pos;
@@ -541,7 +541,7 @@ static int launch_attention(cuda_t *c, const float *q, const float *kc, const fl
     case 64: k_attention<2><<<grid, 256, 0, c->st>>>(q, kc, vc, qg, c->hb, T, nh, nkv, pos0, qstride, gated, scale); break;
     case 128: k_attention<4><<<grid, 256, 0, c->st>>>(q, kc, vc, qg, c->hb, T, nh, nkv, pos0, qstride, gated, scale); break;
     case 256: k_attention<8><<<grid, 256, 0, c->st>>>(q, kc, vc, qg, c->hb, T, nh, nkv, pos0, qstride, gated, scale); break;
-    default: return semif_fail("cuda: head_dim %u is not supported (64, 128, 256)", cfg->head_dim);
+    default: return set_error("cuda: head_dim %u is not supported (64, 128, 256)", cfg->head_dim);
     }
     CKL();
     return 0;
@@ -592,7 +592,7 @@ static int run_layers(cuda_t *c, int T, int pos0) {
             case 32: k_delta_rule<32, 1><<<dim3(nv, blocks((size_t)dv, 32)), 32, 0, st>>>(c->f1, bb, aa, Sl, c->f4, T, C, Dk, nv, nk, dv); break;
             case 64: k_delta_rule<64, 1><<<dim3(nv, blocks((size_t)dv, 32)), 32, 0, st>>>(c->f1, bb, aa, Sl, c->f4, T, C, Dk, nv, nk, dv); break;
             case 128: k_delta_rule<128, 2><<<dim3(nv, blocks((size_t)dv, 16)), 32, 0, st>>>(c->f1, bb, aa, Sl, c->f4, T, C, Dk, nv, nk, dv); break;
-            default: return semif_fail("cuda: linear_key_head_dim %d is not supported (32, 64, 128)", dk);
+            default: return set_error("cuda: linear_key_head_dim %d is not supported (32, 64, 128)", dk);
             }
             CKL();
             k_gated_norm<<<dim3(T, nv), 128, 0, st>>>(c->f4, c->f2, L->lin_norm, c->hb, dv, cfg->eps);
@@ -614,13 +614,13 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
                       float *logits) {
     cuda_t *c = (cuda_t *)b;
     const config_t *cfg = &c->m->cfg;
-    if (n == 0) return semif_fail("forward: no tokens");
-    if (b->pos + n > b->max_seq) return semif_fail("forward: %zu tokens exceed context %zu", b->pos + n, b->max_seq);
-    if (n_ids > SEMIF_MAX_OPTIONS * 4) return semif_fail("forward: too many readout ids");
+    if (n == 0) return set_error("forward: no tokens");
+    if (b->pos + n > b->max_seq) return set_error("forward: %zu tokens exceed context %zu", b->pos + n, b->max_seq);
+    if (n_ids > MAX_OPTIONS * 4) return set_error("forward: too many readout ids");
     for (size_t t = 0; t < n; t++)
-        if (tokens[t] >= cfg->vocab) return semif_fail("forward: token %u out of range", tokens[t]);
+        if (tokens[t] >= cfg->vocab) return set_error("forward: token %u out of range", tokens[t]);
     for (uint32_t k = 0; k < n_ids; k++)
-        if (ids[k] >= cfg->vocab) return semif_fail("forward: readout id %u out of range", ids[k]);
+        if (ids[k] >= cfg->vocab) return set_error("forward: readout id %u out of range", ids[k]);
     CK(cudaSetDevice(c->device));
     const int H = (int)cfg->hidden;
     int last_T = 0;
@@ -660,11 +660,11 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
     const config_t *cfg = &m->cfg;
     int count = 0;
     CK(cudaGetDeviceCount(&count));
-    if (device < 0 || device >= count) return semif_fail("cuda: device %d not found (%d visible)", device, count);
+    if (device < 0 || device >= count) return set_error("cuda: device %d not found (%d visible)", device, count);
     CK(cudaSetDevice(device));
     cudaDeviceProp prop;
     CK(cudaGetDeviceProperties(&prop, device));
-    if (prop.major < 8) return semif_fail("cuda: %s is sm_%d%d; bf16 tensor cores need sm_80+ (built for sm_86)",
+    if (prop.major < 8) return set_error("cuda: %s is sm_%d%d; bf16 tensor cores need sm_80+ (built for sm_86)",
                                           prop.name, prop.major, prop.minor);
     CK(cudaStreamCreate(&c->st));
     if (upload_mat(c, &c->embed, &m->embed)) return -1;
@@ -733,7 +733,7 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
         dmalloc(c, (void **)&c->d_tok, CHUNK * sizeof(uint32_t)) || dmalloc(c, (void **)&c->d_ids, 64 * sizeof(uint32_t)) ||
         dmalloc(c, (void **)&c->d_logits, 64 * sizeof(float)))
         return -1;
-    fprintf(stderr, "semif86: %s (sm_%d%d), weights %.2f GiB, state+scratch %.2f GiB, context %zu\n", prop.name,
+    fprintf(stderr, "cleanroom-transformer: %s (sm_%d%d), weights %.2f GiB, state+scratch %.2f GiB, context %zu\n", prop.name,
             prop.major, prop.minor, weights / 1073741824.0, (c->bytes - weights) / 1073741824.0, max_seq);
     return 0;
 }
@@ -742,7 +742,7 @@ extern "C" backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int 
     cuda_t *c = (cuda_t *)xcalloc(1, sizeof *c);
     c->m = m;
     c->device = device;
-    c->base.name = "cuda-sm86-bf16";
+    c->base.name = "cuda-bf16";
     c->base.reset = cu_reset;
     c->base.forward = cu_forward;
     c->base.snapshot = cu_snapshot;
@@ -887,7 +887,7 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
     gpu->destroy(gpu);
     free(tok);
     if (rc) return -1;
-    if (failed) return semif_fail("selftest: %d check(s) failed", failed);
+    if (failed) return set_error("selftest: %d check(s) failed", failed);
     printf("selftest passed\n");
     return 0;
 }
