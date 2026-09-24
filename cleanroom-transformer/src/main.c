@@ -31,6 +31,10 @@ static void usage(void) {
             "  memory-prove   proof for one id, or that a time window is empty\n"
             "                                     --memory FILE (--id ID | --from US --to US)\n"
             "  memory-verify  check a proof file on its own             --proof FILE [--root HEX]\n"
+            "  memory-similar entries whose hidden states are closest   --memory FILE --id ID [--last K]\n"
+            "  memory-keygen  new Falcon-512 key pair (needs liboqs)    --key-out PREFIX\n"
+            "  memory-sign    sign the memory root (needs liboqs)       --memory FILE --key PREFIX.key\n"
+            "                 memory-verify also checks signatures: add --public-key PREFIX.pub to pin the signer\n"
             "\n"
             "--model is a Hugging Face folder or a .gguf file.\n"
             "\n"
@@ -38,12 +42,16 @@ static void usage(void) {
             "                [--gpu-weights quantized|bf16]   GGUF weights on the GPU (default: quantized)\n"
             "score/serve:    [--memory FILE]  append every decision to a memory file\n"
             "                [--recall N]     also put the last N decisions into each prompt\n"
-            "                                 (prompt version " PROMPT_VERSION_MEMORY "; needs --memory)\n");
+            "                                 (prompt version " PROMPT_VERSION_MEMORY "; needs --memory)\n"
+            "                [--memory-meta JSON]        a JSON object stored with every entry\n"
+            "                [--memory-vectors yes|no]   store each decision's final hidden state\n"
+            "score:          [--sign-key PREFIX.key]     after the run, sign the memory root into FILE.sigs\n");
 }
 
 typedef struct {
     const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor, *expected;
-    const char *memory, *id, *proof, *root;
+    const char *memory, *id, *proof, *root, *memory_meta, *key_out, *key, *public_key, *sign_key;
+    bool memory_vectors;
     uint64_t from_us, to_us;
     bool has_from, has_to;
     size_t last;
@@ -86,6 +94,15 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--to")) a->to_us = strtoull(v, NULL, 10), a->has_to = true;
         else if (!strcmp(k, "--last")) a->last = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--recall")) a->recall = (uint32_t)strtoul(v, NULL, 10);
+        else if (!strcmp(k, "--memory-meta")) a->memory_meta = v;
+        else if (!strcmp(k, "--key-out")) a->key_out = v;
+        else if (!strcmp(k, "--key")) a->key = v;
+        else if (!strcmp(k, "--public-key")) a->public_key = v;
+        else if (!strcmp(k, "--sign-key")) a->sign_key = v;
+        else if (!strcmp(k, "--memory-vectors")) {
+            if (strcmp(v, "yes") && strcmp(v, "no")) return -1;
+            a->memory_vectors = !strcmp(v, "yes");
+        }
         else if (!strcmp(k, "--mode")) a->mode = v;
         else if (!strcmp(k, "--backend")) a->backend = v;
         else if (!strcmp(k, "--host")) a->host = v;
@@ -245,6 +262,12 @@ static int cmd_verify_prompts(const args_t *a) {
 static int cmd_memory(const args_t *a) {
     sbuf_t out = {0};
     int rc = 0;
+    if (!strcmp(a->cmd, "memory-keygen")) {
+        if (!a->key_out) return set_error("memory-keygen needs --key-out PREFIX");
+        if (memory_keygen(a->key_out)) return -1;
+        printf("wrote %s.key (secret, keep private) and %s.pub\n", a->key_out, a->key_out);
+        return 0;
+    }
     if (!strcmp(a->cmd, "memory-verify")) {
         if (!a->proof) return set_error("memory-verify needs --proof");
         char *text;
@@ -253,7 +276,7 @@ static int cmd_memory(const args_t *a) {
         arena_t ar;
         arena_init(&ar, 1 << 16);
         jval *p;
-        rc = json_parse(&ar, text, len, &p) || memory_verify_proof(p, a->root, &out);
+        rc = json_parse(&ar, text, len, &p) || memory_verify_proof(p, a->root, a->public_key, &out);
         arena_free(&ar);
         free(text);
     } else {
@@ -262,6 +285,11 @@ static int cmd_memory(const args_t *a) {
         if (memory_open(a->memory, false, &m)) return -1;
         if (!strcmp(a->cmd, "memory-root")) memory_root_json(m, &out);
         else if (!strcmp(a->cmd, "memory-recall")) memory_recall_lines(m, a->id, a->id ? strlen(a->id) : 0, a->last, &out);
+        else if (!strcmp(a->cmd, "memory-sign"))
+            rc = a->key ? memory_sign(m, a->key, &out) : set_error("memory-sign needs --key PREFIX.key");
+        else if (!strcmp(a->cmd, "memory-similar"))
+            rc = a->id ? memory_similar(m, a->id, strlen(a->id), a->last == SIZE_MAX ? 10 : a->last, &out)
+                       : set_error("memory-similar needs --id");
         else if (a->id && !a->has_from && !a->has_to) rc = memory_prove_id(m, a->id, strlen(a->id), &out);
         else if (!a->id && a->has_from && a->has_to) rc = memory_prove_gap(m, a->from_us, a->to_us, &out);
         else rc = set_error("memory-prove needs either --id, or --from and --to");
@@ -357,6 +385,7 @@ static int cmd_logits(const args_t *a) {
 
 static void close_engine(engine_t *e) {
     if (e->memory) memory_close(e->memory);
+    free(e->memory_meta);
     e->be->destroy(e->be);
     tokenizer_free(e->tok);
     model_free(e->model);
@@ -381,9 +410,26 @@ static int open_engine(const args_t *a, engine_t *e, model_t *m) {
         return -1;
     }
     e->recall = a->recall;
-    if (a->recall && !a->memory) {
+    e->memory_vectors = a->memory_vectors;
+    if ((a->recall || a->memory_meta || a->memory_vectors) && !a->memory) {
         close_engine(e);
-        return set_error("--recall needs --memory");
+        return set_error("--recall, --memory-meta and --memory-vectors need --memory");
+    }
+    if (a->memory_meta) { /* stored in canonical form (Python json.dumps) */
+        arena_t ar;
+        arena_init(&ar, 1 << 12);
+        jval *v;
+        int bad = json_parse(&ar, a->memory_meta, strlen(a->memory_meta), &v) || v->type != J_OBJECT;
+        if (!bad) {
+            sbuf_t b = {0};
+            json_dump_py(&b, v);
+            e->memory_meta = b.data;
+        }
+        arena_free(&ar);
+        if (bad) {
+            close_engine(e);
+            return set_error("--memory-meta must be a JSON object");
+        }
     }
     if (a->memory && memory_open(a->memory, true, &e->memory)) {
         close_engine(e);
@@ -393,8 +439,29 @@ static int open_engine(const args_t *a, engine_t *e, model_t *m) {
 }
 
 
+/* Appends a signed checkpoint of the memory's current root to <memory>.sigs. */
+static int sign_checkpoint(const args_t *a, const memory_t *m) {
+    sbuf_t sig = {0};
+    char path[4096];
+    snprintf(path, sizeof path, "%s.sigs", a->memory);
+    int rc = memory_sign(m, a->sign_key, &sig);
+    if (!rc) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_APPEND, 0644);
+        ssize_t w = fd >= 0 ? write(fd, sig.data, sig.len) : -1;
+        if (fd < 0 || w != (ssize_t)sig.len || fsync(fd)) rc = set_error("cannot append to %s", path);
+        if (fd >= 0) close(fd);
+    }
+    sb_free(&sig);
+    return rc;
+}
+
 static int cmd_score(const args_t *a) {
     if (!a->input || !a->output) return set_error("--input and --output are required");
+    if (a->sign_key) { /* fail before scoring, not after */
+        if (!a->memory) return set_error("--sign-key needs --memory");
+        if (!memory_signing_available()) return memory_keygen(NULL); /* reports the missing liboqs */
+        if (access(a->sign_key, R_OK)) return set_error("cannot read --sign-key %s", a->sign_key);
+    }
     if (strcmp(a->mode, "direct") && strcmp(a->mode, "shared")) return set_error("--mode must be direct or shared");
     arena_t ar;
     arena_init(&ar, 1 << 20);
@@ -433,6 +500,7 @@ static int cmd_score(const args_t *a) {
         }
         sb_free(&b);
         if (fclose(out) && !rc) rc = set_error("cannot write %s", a->output);
+        if (!rc && a->sign_key) rc = sign_checkpoint(a, e.memory);
         close_engine(&e);
     }
     if (fd >= 0) close(fd);
@@ -519,7 +587,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(a.cmd, "shapes")) rc = cmd_shapes(&a);
     else if (!strcmp(a.cmd, "dequant")) rc = cmd_dequant(&a);
     else if (!strcmp(a.cmd, "memory-root") || !strcmp(a.cmd, "memory-recall") || !strcmp(a.cmd, "memory-prove") ||
-             !strcmp(a.cmd, "memory-verify"))
+             !strcmp(a.cmd, "memory-verify") || !strcmp(a.cmd, "memory-similar") || !strcmp(a.cmd, "memory-keygen") ||
+             !strcmp(a.cmd, "memory-sign"))
         rc = cmd_memory(&a);
     else {
         usage();

@@ -19,6 +19,7 @@
 #include "transformer.h"
 
 #include <errno.h>
+#include <math.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -37,6 +38,8 @@ typedef struct {
     uint64_t time_us;
     char *id, *question, *answer_text;
     size_t id_len, question_len, answer_text_len;
+    float *vec; /* optional hidden-state vector */
+    uint32_t dim;
 } entry_t;
 
 struct memory {
@@ -97,6 +100,41 @@ static int unhex(const char *s, size_t len, uint8_t *out, size_t n) {
         else out[k / 2] |= (uint8_t)v;
     }
     return 0;
+}
+
+static const char B64[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+static void b64_encode(const uint8_t *p, size_t n, sbuf_t *out) {
+    for (size_t k = 0; k < n; k += 3) {
+        uint32_t v = (uint32_t)p[k] << 16 | (k + 1 < n ? (uint32_t)p[k + 1] << 8 : 0) | (k + 2 < n ? p[k + 2] : 0);
+        char q[4] = {B64[v >> 18], B64[(v >> 12) & 63], k + 1 < n ? B64[(v >> 6) & 63] : '=', k + 2 < n ? B64[v & 63] : '='};
+        sb_putn(out, q, 4);
+    }
+}
+
+/* Strict: canonical padding only. Returns the decoded length or -1. */
+static long b64_decode(const char *s, size_t len, uint8_t *out, size_t cap) {
+    if (len % 4) return -1;
+    size_t n = 0;
+    for (size_t k = 0; k < len; k += 4) {
+        uint32_t v = 0;
+        int pad = 0;
+        for (int j = 0; j < 4; j++) {
+            const char *c = s[k + j] == '=' ? NULL : memchr(B64, s[k + j], 64);
+            if (s[k + j] == '=') {
+                if (k + 4 != len || j < 2) return -1;
+                pad++;
+            } else if (!c || pad) {
+                return -1;
+            }
+            v = v << 6 | (c ? (uint32_t)(c - B64) : 0);
+        }
+        for (int j = 0; j < 3 - pad; j++) {
+            if (n == cap) return -1;
+            out[n++] = (uint8_t)(v >> (16 - 8 * j));
+        }
+    }
+    return (long)n;
 }
 
 /* ---------------------------------------------------------------- id tree */
@@ -317,6 +355,33 @@ static int add_line(memory_t *m, const char *line, size_t len, size_t line_no) {
         set_error("memory line %zu: empty id", line_no);
         goto done;
     }
+    const jval *meta = json_get(v, "meta"), *vec = json_get(v, "vector");
+    if (meta && meta->type != J_OBJECT) {
+        set_error("memory line %zu: meta must be an object", line_no);
+        goto done;
+    }
+    float *fv = NULL;
+    uint64_t dim = 0;
+    if (vec) {
+        const jval *b64 = json_get(vec, "f32le_b64");
+        if (vec->type != J_OBJECT || !parse_u64(json_get(vec, "dim"), &dim) || dim == 0 || dim > (1u << 20) ||
+            !json_is_str(b64)) {
+            set_error("memory line %zu: vector needs dim and f32le_b64", line_no);
+            goto done;
+        }
+        fv = xmalloc(dim * sizeof *fv);
+        uint8_t *raw = (uint8_t *)fv;
+        if (b64_decode(b64->u.str, b64->n, raw, dim * 4) != (long)(dim * 4)) {
+            free(fv);
+            set_error("memory line %zu: vector data is not %llu float32 values", line_no, (unsigned long long)dim);
+            goto done;
+        }
+        for (uint64_t k = 0; k < dim; k++) { /* little endian on disk */
+            uint32_t u = (uint32_t)raw[4 * k] | (uint32_t)raw[4 * k + 1] << 8 | (uint32_t)raw[4 * k + 2] << 16 |
+                         (uint32_t)raw[4 * k + 3] << 24;
+            memcpy(&fv[k], &u, 4);
+        }
+    }
     if (m->n == m->cap) {
         m->cap = m->cap ? 2 * m->cap : 64;
         m->e = xrealloc(m->e, m->cap * sizeof *m->e);
@@ -327,6 +392,7 @@ static int add_line(memory_t *m, const char *line, size_t len, size_t line_no) {
     e->id = mdup(id->u.str, id->n), e->id_len = id->n;
     e->question = mdup(q->u.str, q->n), e->question_len = q->n;
     e->answer_text = mdup(ans->u.str, ans->n), e->answer_text_len = ans->n;
+    e->vec = fv, e->dim = (uint32_t)dim;
     h_leaf(line, len, e->hash);
     id_key(e->id, e->id_len, e->key);
     m->n++;
@@ -406,7 +472,8 @@ int memory_open(const char *path, bool writable, memory_t **out) {
 void memory_close(memory_t *m) {
     if (!m) return;
     if (m->fd >= 0) close(m->fd);
-    for (size_t k = 0; k < m->n; k++) free(m->e[k].line), free(m->e[k].id), free(m->e[k].question), free(m->e[k].answer_text);
+    for (size_t k = 0; k < m->n; k++)
+        free(m->e[k].line), free(m->e[k].id), free(m->e[k].question), free(m->e[k].answer_text), free(m->e[k].vec);
     free(m->e);
     free(m->path);
     free(m);
@@ -416,7 +483,7 @@ size_t memory_count(const memory_t *m) { return m->n; }
 
 /* ------------------------------------------------------------------ append */
 int memory_append(memory_t *m, const decision_t *d, const double *p, const char *prompt_sha256,
-                  const char *prompt_version, const char *revision, uint32_t recalled) {
+                  const char *prompt_version, const char *revision, uint32_t recalled, const memory_extra_t *x) {
     if (m->fd < 0) return set_error("memory: opened read-only");
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -452,7 +519,24 @@ int memory_append(memory_t *m, const decision_t *d, const double *p, const char 
     }
     sb_printf(&b, "], \"prompt_sha256\": \"%s\", \"prompt_version\": \"%s\", \"revision\": ", prompt_sha256, prompt_version);
     json_dump_str(&b, revision, strlen(revision));
-    sb_printf(&b, ", \"recalled\": %u, \"prev\": \"%s\"}", recalled, prev);
+    sb_printf(&b, ", \"recalled\": %u", recalled);
+    if (x && x->meta) {
+        sb_puts(&b, ", \"meta\": ");
+        sb_putn(&b, x->meta, x->meta_len);
+    }
+    if (x && x->vector) {
+        uint8_t *raw = xmalloc((size_t)x->dim * 4);
+        for (uint32_t k = 0; k < x->dim; k++) {
+            uint32_t u;
+            memcpy(&u, &x->vector[k], 4);
+            for (int j = 0; j < 4; j++) raw[4 * k + j] = (uint8_t)(u >> (8 * j));
+        }
+        sb_printf(&b, ", \"vector\": {\"dim\": %u, \"f32le_b64\": \"", x->dim);
+        b64_encode(raw, (size_t)x->dim * 4, &b);
+        sb_puts(&b, "\"}");
+        free(raw);
+    }
+    sb_printf(&b, ", \"prev\": \"%s\"}", prev);
     int rc = add_line(m, b.data, b.len, m->n + 1);
     if (!rc) {
         sb_putc(&b, '\n');
@@ -461,7 +545,7 @@ int memory_append(memory_t *m, const decision_t *d, const double *p, const char 
             rc = set_error("memory: cannot write %s", m->path);
             m->n--; /* not stored: forget it */
             entry_t *e = &m->e[m->n];
-            free(e->line), free(e->id), free(e->question), free(e->answer_text);
+            free(e->line), free(e->id), free(e->question), free(e->answer_text), free(e->vec);
         }
     }
     sb_free(&b);
@@ -504,6 +588,50 @@ void memory_recall_lines(const memory_t *m, const char *id, size_t id_len, size_
         sb_putn(out, m->e[k].line, m->e[k].len);
         sb_putc(out, '\n');
     }
+}
+
+/* Cosine similarity of every stored vector to the latest vector for `id`, best first. */
+int memory_similar(const memory_t *m, const char *id, size_t id_len, size_t top, sbuf_t *out) {
+    const entry_t *q = NULL;
+    for (size_t k = m->n; k-- > 0 && !q;)
+        if (id_is(&m->e[k], id, id_len)) q = &m->e[k];
+    if (!q) return set_error("memory: id %.*s was never recorded", (int)id_len, id);
+    if (!q->vec) return set_error("memory: the latest entry for %.*s has no vector (score with --memory-vectors yes)", (int)id_len, id);
+    typedef struct {
+        double sim;
+        size_t k;
+    } hit_t;
+    hit_t *hits = xcalloc(m->n, sizeof *hits);
+    size_t nh = 0;
+    double qn = 0;
+    for (uint32_t d = 0; d < q->dim; d++) qn += (double)q->vec[d] * q->vec[d];
+    for (size_t k = 0; k < m->n; k++) {
+        const entry_t *e = &m->e[k];
+        if (e == q || !e->vec || e->dim != q->dim) continue;
+        double dot = 0, en = 0;
+        for (uint32_t d = 0; d < q->dim; d++) dot += (double)q->vec[d] * e->vec[d], en += (double)e->vec[d] * e->vec[d];
+        hits[nh].sim = qn > 0 && en > 0 ? dot / sqrt(qn * en) : 0;
+        hits[nh++].k = k;
+    }
+    for (size_t i = 1; i < nh; i++) /* insertion sort, best first; ties keep the older entry first */
+        for (size_t j = i; j > 0 && hits[j].sim > hits[j - 1].sim; j--) {
+            hit_t t = hits[j];
+            hits[j] = hits[j - 1], hits[j - 1] = t;
+        }
+    for (size_t i = 0; i < nh && i < top; i++) {
+        const entry_t *e = &m->e[hits[i].k];
+        sb_printf(out, "{\"seq\": %zu, \"id\": ", hits[i].k);
+        json_dump_str(out, e->id, e->id_len);
+        sb_puts(out, ", \"similarity\": ");
+        json_dump_double(out, hits[i].sim);
+        sb_puts(out, ", \"question\": ");
+        json_dump_str(out, e->question, e->question_len);
+        sb_puts(out, ", \"answer\": ");
+        json_dump_str(out, e->answer_text, e->answer_text_len);
+        sb_puts(out, "}\n");
+    }
+    free(hits);
+    return 0;
 }
 
 int memory_prove_id(const memory_t *m, const char *id, size_t id_len, sbuf_t *out) {
@@ -585,10 +713,17 @@ static int read_siblings(const jval *p, int depth, uint8_t sib[][HL]) {
     return 0;
 }
 
-int memory_verify_proof(const jval *p, const char *expect_root, sbuf_t *summary) {
+void memory_root_bytes(const memory_t *m, uint8_t root[64]) {
+    roots_t r;
+    compute_roots(m, &r);
+    memcpy(root, r.root, HL);
+}
+
+int memory_verify_proof(const jval *p, const char *expect_root, const char *trusted_pub, sbuf_t *summary) {
     empty_init();
     const jval *type = json_get(p, "type");
     if (!json_is_str(type)) return set_error("proof: missing type");
+    if (!strcmp(type->u.str, "memory-signature")) return memory_verify_signature(p, expect_root, trusted_pub, summary);
     roots_t r;
     uint64_t count;
     if (read_hex(p, "id_root", r.id_root) || read_hex(p, "time_root", r.time_root) || read_hex(p, "head", r.head) ||
