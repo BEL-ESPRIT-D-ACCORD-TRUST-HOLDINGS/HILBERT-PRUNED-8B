@@ -223,6 +223,34 @@ Marks (`\p{M}`) count as punctuation, not letters. With
 `ignore_merges == true`, a piece that is already a vocabulary entry is
 emitted whole, before any merging.
 
+### 4.7 GGUF checkpoints
+
+A `.gguf` file (version 2 or 3; magic `GGUF`) is read as follows.
+
+- **Config.** Read from `llama.*` metadata: `block_count`,
+  `embedding_length`, `feed_forward_length`, `attention.head_count`,
+  `attention.head_count_kv`, `attention.key_length`, `rope.dimension_count`,
+  `rope.freq_base`, `attention.layer_norm_rms_epsilon` and `vocab_size`. The
+  head is tied when `output.weight` is absent. Only
+  `general.architecture = llama` is accepted.
+- **Tensor names.** `token_embd`, `output_norm` and `output` map to the
+  embeddings, final norm and head. `blk.{i}.{attn_norm, ffn_norm, attn_q,
+  attn_k, attn_v, attn_output, ffn_gate, ffn_up, ffn_down}` map to the layer
+  weights of section 4.5. Dimension `ne[0]` is the row (input) dimension.
+- **Query/key rows.** For `attn_q` (heads `nh`) and `attn_k` (heads `nkv`),
+  Hugging Face row `j*(d/2) + i` of each head (`j` in {0, 1}, `i < d/2`) is
+  stored at row `2i + j` of that head. The loader undoes this.
+- **RoPE scaling.** If `rope_freqs.weight` is present, each inverse
+  frequency is divided by its entry.
+- **Tokenizer.** `tokenizer.ggml.model = gpt2` and `tokenizer.ggml.pre =
+  llama-bpe` select the Llama 3 rules of section 4.5. Tokens with
+  `token_type` 3 (control) or 4 (user-defined) are added tokens.
+  `tokenizer.chat_template` and `tokenizer.ggml.bos_token_id` supply the
+  prompt format.
+- **Dequantization.** Formats follow ggml's block layouts (Q4_0 through
+  Q8_0 with 32-value blocks; Q2_K through Q6_K with 256-value super-blocks).
+  Rows are dequantized to float32 exactly as `gguf.quants.dequantize` does.
+
 ### 4.6 Shape contract
 
 Every per-layer weight is listed once, as `[rows = out, cols = in]` together

@@ -77,7 +77,56 @@ static bool has(const char *s, size_t n, const char *needle) {
     return false;
 }
 
+/* Identifies the template family; `bos` is the BOS token text, if the model defines one. */
+static int chat_format_detect(const char *tmpl, size_t tmpl_len, const char *bos, size_t bos_len, const char *where,
+                              chat_format_t *out) {
+    if (!tmpl)
+        return set_error("%s has no chat template; base models without one cannot be prompted", where);
+    if (has(tmpl, tmpl_len, "<|im_start|>") && has(tmpl, tmpl_len, "enable_thinking")) {
+        out->kind = CHAT_QWEN35;
+        return 0;
+    }
+    if (has(tmpl, tmpl_len, "<|start_header_id|>") && has(tmpl, tmpl_len, "<|eot_id|>") &&
+        !has(tmpl, tmpl_len, "Cutting Knowledge") && !has(tmpl, tmpl_len, "tools")) {
+        out->kind = CHAT_LLAMA3;
+        if (has(tmpl, tmpl_len, "bos_token")) {
+            if (!bos || bos_len >= sizeof out->bos)
+                return set_error("%s: the chat template uses bos_token but no BOS token is defined", where);
+            memcpy(out->bos, bos, bos_len);
+        }
+        return 0;
+    }
+    return set_error("%s: unsupported chat template (supported: Qwen3.5 and Llama 3 Instruct)", where);
+}
+
+/* Chat template and BOS text from GGUF metadata (tokenizer.chat_template, tokenizer.ggml.bos_token_id). */
+int chat_format_from_gguf(const gguf_t *g, chat_format_t *out) {
+    memset(out, 0, sizeof *out);
+    const char *tmpl = NULL, *bos = NULL;
+    size_t tmpl_len = 0, bos_len = 0;
+    gguf_get_str(g, "tokenizer.chat_template", &tmpl, &tmpl_len);
+    uint64_t bos_id;
+    gguf_array_t tokens;
+    if (gguf_get_u64(g, "tokenizer.ggml.bos_token_id", &bos_id) && gguf_array(g, "tokenizer.ggml.tokens", &tokens) == 0 &&
+        tokens.elem_type == 8 && bos_id < tokens.n) {
+        const unsigned char *pos = tokens.data;
+        for (uint64_t k = 0; k <= bos_id; k++)
+            if (!gguf_array_next_str(&tokens, &pos, &bos, &bos_len)) {
+                bos = NULL;
+                break;
+            }
+    }
+    return chat_format_detect(tmpl, tmpl_len, bos, bos_len, "GGUF", out);
+}
+
 int chat_format_load(const char *dir, chat_format_t *out) {
+    if (path_is_gguf(dir)) {
+        gguf_t *g;
+        if (gguf_open(dir, &g)) return -1;
+        int rc = chat_format_from_gguf(g, out);
+        gguf_close(g);
+        return rc;
+    }
     memset(out, 0, sizeof *out);
     char path[4096], *text = NULL, *cfg_text = NULL;
     size_t len = 0, cfg_len = 0;
@@ -95,25 +144,10 @@ int chat_format_load(const char *dir, chat_format_t *out) {
         const jval *ct = json_get(cfg, "chat_template");
         if (json_is_str(ct)) tmpl = ct->u.str, tmpl_len = ct->n;
     }
-    int rc = 0;
-    if (!tmpl) {
-        rc = set_error("%s has no chat template (chat_template.jinja or tokenizer_config.json); "
-                       "base models without one cannot be prompted", dir);
-    } else if (has(tmpl, tmpl_len, "<|im_start|>") && has(tmpl, tmpl_len, "enable_thinking")) {
-        out->kind = CHAT_QWEN35;
-    } else if (has(tmpl, tmpl_len, "<|start_header_id|>") && has(tmpl, tmpl_len, "<|eot_id|>") &&
-               !has(tmpl, tmpl_len, "Cutting Knowledge") && !has(tmpl, tmpl_len, "tools")) {
-        out->kind = CHAT_LLAMA3;
-        const jval *bos = json_get(cfg, "bos_token");
-        if (bos && bos->type == J_OBJECT) bos = json_get(bos, "content");
-        if (has(tmpl, tmpl_len, "bos_token")) {
-            if (!json_is_str(bos) || bos->n >= sizeof out->bos)
-                rc = set_error("%s: the chat template uses bos_token but tokenizer_config.json has none", dir);
-            else memcpy(out->bos, bos->u.str, bos->n);
-        }
-    } else {
-        rc = set_error("%s: unsupported chat template (supported: Qwen3.5 and Llama 3 Instruct)", dir);
-    }
+    const jval *bos = json_get(cfg, "bos_token");
+    if (bos && bos->type == J_OBJECT) bos = json_get(bos, "content");
+    int rc = chat_format_detect(tmpl, tmpl_len, json_is_str(bos) ? bos->u.str : NULL, json_is_str(bos) ? bos->n : 0,
+                                dir, out);
     arena_free(&a);
     free(text);
     free(cfg_text);

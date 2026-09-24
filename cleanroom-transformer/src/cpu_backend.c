@@ -1,7 +1,7 @@
 /* cpu_backend.c - float32 reference forward pass (SPEC.md 4).
  *
- * Activations are float32; weights stay in their checkpoint dtype and are
- * widened on the fly. This backend is the numeric reference that the CUDA
+ * Activations are float32; weights stay in their checkpoint dtype (GGUF weights
+ * stay quantized) and are widened one row at a time. This backend is the numeric reference that the CUDA
  * backend is checked against. It uses OpenMP when built with -fopenmp.
  */
 #include "transformer.h"
@@ -22,18 +22,7 @@ typedef struct {
     bool has_snap;
 } cpu_t;
 
-static void widen_row(const wmat_t *w, uint32_t r, float *out) {
-    size_t off = (size_t)r * w->cols;
-    if (w->dtype == DT_F32) {
-        memcpy(out, (const float *)w->data + off, w->cols * sizeof(float));
-    } else if (w->dtype == DT_BF16) {
-        const uint16_t *p = (const uint16_t *)w->data + off;
-        for (uint32_t k = 0; k < w->cols; k++) out[k] = bf16_to_f32(p[k]);
-    } else {
-        const uint16_t *p = (const uint16_t *)w->data + off;
-        for (uint32_t k = 0; k < w->cols; k++) out[k] = f16_to_f32(p[k]);
-    }
-}
+static void widen_row(const wmat_t *w, uint32_t r, float *out) { wmat_row_f32(w, r, out); }
 
 static float dot(const float *a, const float *b, size_t n) {
     float acc[8] = {0};

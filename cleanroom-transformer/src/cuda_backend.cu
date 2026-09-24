@@ -458,28 +458,30 @@ static int upload_vec(cuda_t *c, float **dst, const float *src, size_t n) {
 static int upload_mat(cuda_t *c, bf16 **dst, const wmat_t *w) {
     size_t n = (size_t)w->rows * w->cols;
     if (dmalloc(c, (void **)dst, n * sizeof(bf16))) return -1;
-    if (w->dtype == DT_BF16) {
+    if (w->dtype == DT_BF16 && !w->perm_heads) {
         CK(cudaMemcpy(*dst, w->data, n * sizeof(bf16), cudaMemcpyHostToDevice));
         return 0;
     }
-    const size_t step = (size_t)1 << 22;
-    uint16_t *tmp = (uint16_t *)xmalloc(step * sizeof(uint16_t));
-    for (size_t o = 0; o < n; o += step) {
-        size_t m = n - o < step ? n - o : step;
-        for (size_t k = 0; k < m; k++) {
-            float f;
-            if (w->dtype == DT_F32) memcpy(&f, (const float *)w->data + o + k, 4);
-            else f = f16_to_f32(((const uint16_t *)w->data)[o + k]);
-            tmp[k] = f32_to_bf16(f);
+    // Other dtypes (F32, F16, GGUF quantized) and reordered rows: widen rows on the host, round to bf16,
+    // upload about 16 MiB at a time.
+    size_t rows_per = ((size_t)1 << 23) / w->cols;
+    if (rows_per == 0) rows_per = 1;
+    uint16_t *tmp = (uint16_t *)xmalloc(rows_per * w->cols * sizeof(uint16_t));
+    float *row = (float *)xmalloc(w->cols * sizeof(float));
+    int rc = 0;
+    for (size_t r0 = 0; r0 < w->rows && !rc; r0 += rows_per) {
+        size_t m = w->rows - r0 < rows_per ? w->rows - r0 : rows_per;
+        for (size_t i = 0; i < m; i++) {
+            wmat_row_f32(w, (uint32_t)(r0 + i), row);
+            for (uint32_t k = 0; k < w->cols; k++) tmp[i * w->cols + k] = f32_to_bf16(row[k]);
         }
-        cudaError_t e = cudaMemcpy((uint16_t *)*dst + o, tmp, m * sizeof(uint16_t), cudaMemcpyHostToDevice);
-        if (e != cudaSuccess) {
-            free(tmp);
-            return set_error("CUDA upload failed: %s", cudaGetErrorString(e));
-        }
+        cudaError_t e = cudaMemcpy((uint16_t *)*dst + r0 * w->cols, tmp, m * w->cols * sizeof(uint16_t),
+                                   cudaMemcpyHostToDevice);
+        if (e != cudaSuccess) rc = set_error("CUDA upload failed: %s", cudaGetErrorString(e));
     }
     free(tmp);
-    return 0;
+    free(row);
+    return rc;
 }
 
 static size_t conv_dim(const config_t *cfg) {

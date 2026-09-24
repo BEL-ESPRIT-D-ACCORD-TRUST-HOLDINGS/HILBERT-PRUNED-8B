@@ -187,7 +187,9 @@ def check_logits(binary: Path, workdir: Path, failures: list[str]) -> None:
                     failures.append(f"logits {label} T={length} split={split}: {err:.3e}")
 
 
-def check_tokenizer(binary: Path, workdir: Path, tokenizer: Path, failures: list[str]) -> None:
+def check_tokenizer(binary: Path, workdir: Path, tokenizer: Path, failures: list[str], model: Path | None = None,
+                    label: str = "tokenizer") -> None:
+    """Engine tokenization (of `model`, default the tokenizer's folder) vs HF `tokenizers` on `tokenizer`."""
     from tokenizers import Tokenizer
 
     tok = Tokenizer.from_file(str(tokenizer))
@@ -208,9 +210,9 @@ def check_tokenizer(binary: Path, workdir: Path, tokenizer: Path, failures: list
     texts += ["".join(rng.choice(pool) for _ in range(rng.randint(1, 80))) for _ in range(400)]
     corpus = workdir / "tokenizer-corpus.jsonl"
     corpus.write_text("".join(json.dumps(t) + "\n" for t in texts))
-    got = run(binary, "tokenize", "--model", str(tokenizer.parent), "--input", str(corpus)).splitlines()
+    got = run(binary, "tokenize", "--model", str(model or tokenizer.parent), "--input", str(corpus)).splitlines()
     bad = [t for t, line in zip(texts, got) if line.split() != [str(i) for i in tok.encode(t, add_special_tokens=False).ids]]
-    print(f"  tokenizer: {len(texts) - len(bad)}/{len(texts)} strings identical to HF tokenizers")
+    print(f"  {label}: {len(texts) - len(bad)}/{len(texts)} strings identical to HF tokenizers")
     if bad or len(got) != len(texts):
         failures.append(f"tokenizer: {len(bad)} mismatches, first {bad[0][:40]!r}" if bad else "tokenizer: line count")
 

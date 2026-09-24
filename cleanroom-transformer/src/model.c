@@ -57,7 +57,63 @@ static int load_rope(const jval *cfg, config_t *c, double *partial) {
     return set_error("config: rope_type %s is not supported", json_is_str(rtype) ? rtype->u.str : "?");
 }
 
+/* Llama-architecture config from GGUF metadata (llama.cpp key names). */
+static int config_from_gguf(const gguf_t *g, config_t *c) {
+    memset(c, 0, sizeof *c);
+    const char *arch;
+    size_t n;
+    if (!gguf_get_str(g, "general.architecture", &arch, &n)) return set_error("GGUF: missing general.architecture");
+    if (n != 5 || memcmp(arch, "llama", 5))
+        return set_error("GGUF: architecture %.*s is not supported (llama)", (int)n, arch);
+    uint64_t v;
+#define NEED(key, field)                                                           \
+    do {                                                                           \
+        if (!gguf_get_u64(g, key, &v) || v == 0 || v > 1000000000u)                \
+            return set_error("GGUF: missing or bad %s", key);                      \
+        c->field = (uint32_t)v;                                                    \
+    } while (0)
+    NEED("llama.block_count", n_layers);
+    NEED("llama.embedding_length", hidden);
+    NEED("llama.feed_forward_length", intermediate);
+    NEED("llama.attention.head_count", n_heads);
+#undef NEED
+    c->n_kv_heads = gguf_get_u64(g, "llama.attention.head_count_kv", &v) ? (uint32_t)v : c->n_heads;
+    c->head_dim = gguf_get_u64(g, "llama.attention.key_length", &v) ? (uint32_t)v : c->hidden / c->n_heads;
+    c->rot_dim = gguf_get_u64(g, "llama.rope.dimension_count", &v) ? (uint32_t)v : c->head_dim;
+    if (gguf_get_u64(g, "llama.vocab_size", &v)) {
+        c->vocab = (uint32_t)v;
+    } else {
+        const gguf_tensor_t *e = gguf_tensor(g, "token_embd.weight");
+        if (!e) return set_error("GGUF: cannot determine the vocabulary size");
+        c->vocab = (uint32_t)e->ne[1];
+    }
+    double f = 10000.0, eps = 1e-5;
+    gguf_get_f64(g, "llama.rope.freq_base", &f);
+    gguf_get_f64(g, "llama.attention.layer_norm_rms_epsilon", &eps);
+    c->rope_theta = (float)f;
+    c->eps = (float)eps;
+    const char *st;
+    if (gguf_get_str(g, "llama.rope.scaling.type", &st, &n) && !(n == 4 && !memcmp(st, "none", 4)))
+        return set_error("GGUF: rope scaling type %.*s is not supported", (int)n, st);
+    if (c->n_layers > 256 || c->n_heads % c->n_kv_heads || c->rot_dim > c->head_dim || c->rot_dim == 0 ||
+        c->rot_dim % 2 || c->head_dim % 2)
+        return set_error("GGUF: unsupported head layout");
+    c->arch = ARCH_LLAMA;
+    c->tied = gguf_tensor(g, "output.weight") == NULL;
+    c->norm_offset = 0.0f;
+    for (uint32_t l = 0; l < c->n_layers; l++) c->layer_type[l] = LAYER_FULL;
+    c->n_full = c->n_layers;
+    return 0;
+}
+
 int config_load(const char *dir, config_t *c) {
+    if (path_is_gguf(dir)) {
+        gguf_t *g;
+        if (gguf_open(dir, &g)) return -1;
+        int rc = config_from_gguf(g, c);
+        gguf_close(g);
+        return rc;
+    }
     memset(c, 0, sizeof *c);
     char path[4096];
     snprintf(path, sizeof path, "%s/config.json", dir);
@@ -183,7 +239,7 @@ static int bind_mat(binder_t *b, wmat_t *w, uint32_t rows, uint32_t cols, const 
         return set_error("weights: %s has shape [%llu, %llu], expected [%u, %u]", t->name,
                           (unsigned long long)t->shape[0], (unsigned long long)(t->ndim > 1 ? t->shape[1] : 0),
                           rows, cols);
-    *w = (wmat_t){t->dtype, rows, cols, t->data};
+    *w = (wmat_t){t->dtype, rows, cols, t->data, 0, 0};
     return 0;
 }
 
@@ -224,25 +280,128 @@ static int bind_vec(binder_t *b, float **v, uint64_t count, const char *fmt, int
     return 0;
 }
 
-int model_load(const char *dir, model_t *m) {
-    memset(m, 0, sizeof *m);
-    snprintf(m->source, sizeof m->source, "%s", dir);
+void wmat_row_f32(const wmat_t *w, uint32_t r, float *out) {
+    uint32_t src = r;
+    if (w->perm_heads) {
+        /* llama.cpp stores each head's rotary pairs interleaved: row 2i+j of a head holds
+         * Hugging Face row j*(hd/2)+i. Undo that so the half-split RoPE applies. */
+        uint32_t hd = w->rows / w->perm_heads, half = hd / 2, within = r % hd;
+        src = r - within + 2 * (within % half) + within / half;
+    }
+    size_t off = (size_t)src * w->cols;
+    switch (w->dtype) {
+    case DT_F32: memcpy(out, (const float *)w->data + off, w->cols * sizeof(float)); break;
+    case DT_BF16:
+        for (uint32_t k = 0; k < w->cols; k++) out[k] = bf16_to_f32(((const uint16_t *)w->data)[off + k]);
+        break;
+    case DT_F16:
+        for (uint32_t k = 0; k < w->cols; k++) out[k] = f16_to_f32(((const uint16_t *)w->data)[off + k]);
+        break;
+    case DT_GGML:
+        ggml_dequantize_row(w->ggml_type, (const char *)w->data + (size_t)src * ggml_row_bytes(w->ggml_type, w->cols),
+                            out, w->cols);
+        break;
+    }
+}
+
+/* ---------------------------------------------------------------- GGUF */
+/* Hugging Face per-layer weight name (layer_weights) -> llama.cpp name. */
+static const char *gguf_layer_name(const char *hf) {
+    static const char *map[][2] = {
+        {"self_attn.q_proj.weight", "attn_q.weight"},   {"self_attn.k_proj.weight", "attn_k.weight"},
+        {"self_attn.v_proj.weight", "attn_v.weight"},   {"self_attn.o_proj.weight", "attn_output.weight"},
+        {"mlp.gate_proj.weight", "ffn_gate.weight"},    {"mlp.up_proj.weight", "ffn_up.weight"},
+        {"mlp.down_proj.weight", "ffn_down.weight"},
+    };
+    for (size_t k = 0; k < sizeof map / sizeof *map; k++)
+        if (!strcmp(map[k][0], hf)) return map[k][1];
+    return NULL;
+}
+
+static int gguf_mat(const gguf_t *g, const char *name, uint32_t rows, uint32_t cols, uint32_t perm, wmat_t *w) {
+    const gguf_tensor_t *t = gguf_tensor(g, name);
+    if (!t) return set_error("GGUF: missing tensor %s", name);
+    if (t->n_dims != 2 || t->ne[0] != cols || t->ne[1] != rows)
+        return set_error("GGUF: %s has shape [%llu, %llu], expected [%u, %u]", name,
+                         (unsigned long long)t->ne[1], (unsigned long long)t->ne[0], rows, cols);
+    const void *data = gguf_tensor_data(g, t);
+    if (!data) return -1;
+    *w = (wmat_t){DT_GGML, rows, cols, data, t->type, perm};
+    return 0;
+}
+
+static int gguf_vec(const gguf_t *g, const char *name, uint32_t n, float **out) {
+    wmat_t w;
+    const gguf_tensor_t *t = gguf_tensor(g, name);
+    if (!t) return set_error("GGUF: missing tensor %s", name);
+    if (t->n_dims != 1 || t->ne[0] != n)
+        return set_error("GGUF: %s has %llu values, expected %u", name, (unsigned long long)t->ne[0], n);
+    const void *data = gguf_tensor_data(g, t);
+    if (!data) return -1;
+    w = (wmat_t){DT_GGML, 1, n, data, t->type, 0};
+    *out = xmalloc(n * sizeof(float));
+    wmat_row_f32(&w, 0, *out);
+    return 0;
+}
+
+static int model_load_gguf(const char *path, model_t *m) {
+    if (gguf_open(path, &m->gguf)) return -1;
+    const gguf_t *g = m->gguf;
+    if (config_from_gguf(g, &m->cfg)) return -1;
+    const config_t *c = &m->cfg;
+    char name[160];
+    if (gguf_mat(g, "token_embd.weight", c->vocab, c->hidden, 0, &m->embed) ||
+        gguf_vec(g, "output_norm.weight", c->hidden, &m->final_norm))
+        return -1;
+    if (c->tied) m->lm_head = m->embed;
+    else if (gguf_mat(g, "output.weight", c->vocab, c->hidden, 0, &m->lm_head)) return -1;
+    m->layers = xcalloc(c->n_layers, sizeof *m->layers);
+    weight_shape_t tab[16];
+    int n = layer_weights(c, LAYER_FULL, tab, 16);
+    for (uint32_t l = 0; l < c->n_layers; l++) {
+        layer_t *L = &m->layers[l];
+        L->type = LAYER_FULL;
+        L->slot = l;
+        snprintf(name, sizeof name, "blk.%u.attn_norm.weight", l);
+        if (gguf_vec(g, name, c->hidden, &L->in_norm)) return -1;
+        snprintf(name, sizeof name, "blk.%u.ffn_norm.weight", l);
+        if (gguf_vec(g, name, c->hidden, &L->post_norm)) return -1;
+        for (int k = 0; k < n; k++) {
+            const char *gn = gguf_layer_name(tab[k].name);
+            wmat_t *w = !strcmp(tab[k].name, "self_attn.q_proj.weight")   ? &L->q
+                        : !strcmp(tab[k].name, "self_attn.k_proj.weight") ? &L->k
+                        : !strcmp(tab[k].name, "self_attn.v_proj.weight") ? &L->v
+                        : !strcmp(tab[k].name, "self_attn.o_proj.weight") ? &L->o
+                        : !strcmp(tab[k].name, "mlp.gate_proj.weight")    ? &L->gate
+                        : !strcmp(tab[k].name, "mlp.up_proj.weight")      ? &L->up
+                        : !strcmp(tab[k].name, "mlp.down_proj.weight")    ? &L->down
+                                                                         : NULL;
+            if (!gn || !w) return set_error("GGUF: no mapping for %s", tab[k].name);
+            uint32_t perm = w == &L->q ? c->n_heads : w == &L->k ? c->n_kv_heads : 0;
+            snprintf(name, sizeof name, "blk.%u.%s", l, gn);
+            if (gguf_mat(g, name, tab[k].rows, tab[k].cols, perm, w)) return -1;
+        }
+    }
+    return 0;
+}
+
+/* Hugging Face folder: config.json + safetensors. */
+static int model_load_st(const char *dir, model_t *m) {
     if (config_load(dir, &m->cfg) || st_open_dir(dir, &m->st)) return -1;
     const config_t *c = &m->cfg;
     binder_t b = {m, "model.language_model."};
     if (!st_find(&m->st, "model.language_model.embed_tokens.weight")) strcpy(b.prefix, "model.");
     if (bind_mat(&b, &m->embed, c->vocab, c->hidden, "embed_tokens.weight", 0) ||
         bind_vec(&b, &m->final_norm, c->hidden, "norm.weight", 0))
-        goto fail;
+        return -1;
     if (c->tied) {
         m->lm_head = m->embed;
     } else {
         const st_tensor_t *t = st_find(&m->st, "lm_head.weight");
         if (!t || t->ndim != 2 || t->shape[0] != c->vocab || t->shape[1] != c->hidden) {
-            set_error("weights: missing or bad lm_head.weight");
-            goto fail;
+            return set_error("weights: missing or bad lm_head.weight");
         }
-        m->lm_head = (wmat_t){t->dtype, c->vocab, c->hidden, t->data};
+        m->lm_head = (wmat_t){t->dtype, c->vocab, c->hidden, t->data, 0, 0};
     }
     const uint32_t H = c->hidden, hd = c->head_dim;
     const uint32_t C = 2 * c->lin_k_heads * c->lin_k_dim + c->lin_v_heads * c->lin_v_dim;
@@ -257,17 +416,17 @@ int model_load(const char *dir, model_t *m) {
             bind_layer(&b, c, L->type, "mlp.gate_proj.weight", &L->gate, i) ||
             bind_layer(&b, c, L->type, "mlp.up_proj.weight", &L->up, i) ||
             bind_layer(&b, c, L->type, "mlp.down_proj.weight", &L->down, i))
-            goto fail;
+            return -1;
         if (L->type == LAYER_FULL) {
             L->slot = n_full++;
             if (bind_layer(&b, c, L->type, "self_attn.q_proj.weight", &L->q, i) ||
                 bind_layer(&b, c, L->type, "self_attn.k_proj.weight", &L->k, i) ||
                 bind_layer(&b, c, L->type, "self_attn.v_proj.weight", &L->v, i) ||
                 bind_layer(&b, c, L->type, "self_attn.o_proj.weight", &L->o, i))
-                goto fail;
+                return -1;
             if (c->qk_norm && (bind_vec(&b, &L->q_norm, hd, "layers.%d.self_attn.q_norm.weight", i) ||
                                bind_vec(&b, &L->k_norm, hd, "layers.%d.self_attn.k_norm.weight", i)))
-                goto fail;
+                return -1;
         } else {
             L->slot = n_lin++;
             if (bind_layer(&b, c, L->type, "linear_attn.in_proj_qkv.weight", &L->qkv, i) ||
@@ -279,9 +438,15 @@ int model_load(const char *dir, model_t *m) {
                 bind_vec(&b, &L->A_log, c->lin_v_heads, "layers.%d.linear_attn.A_log", i) ||
                 bind_vec(&b, &L->dt_bias, c->lin_v_heads, "layers.%d.linear_attn.dt_bias", i) ||
                 bind_vec(&b, &L->lin_norm, c->lin_v_dim, "layers.%d.linear_attn.norm.weight", i))
-                goto fail;
+                return -1;
         }
     }
+    return 0;
+}
+
+/* RoPE inverse frequencies, including Llama 3.1 scaling from config.json or GGUF. */
+static int model_rope(model_t *m) {
+    const config_t *c = &m->cfg;
     m->rope_inv_freq = xmalloc(c->rot_dim / 2 * sizeof(float));
     for (uint32_t k = 0; k < c->rot_dim / 2; k++) {
         float f = 1.0f / powf(c->rope_theta, (float)(2 * k) / (float)c->rot_dim); /* float32, as torch */
@@ -300,10 +465,24 @@ int model_load(const char *dir, model_t *m) {
         }
         m->rope_inv_freq[k] = f;
     }
+    /* GGUF stores Llama 3.1 RoPE scaling as per-frequency divisors (rope_freqs.weight). */
+    const gguf_tensor_t *rf = m->gguf ? gguf_tensor(m->gguf, "rope_freqs.weight") : NULL;
+    if (rf) {
+        float *div = NULL;
+        if (gguf_vec(m->gguf, "rope_freqs.weight", c->rot_dim / 2, &div)) return -1;
+        for (uint32_t k = 0; k < c->rot_dim / 2; k++) m->rope_inv_freq[k] /= div[k];
+        free(div);
+    }
     return 0;
-fail:
-    model_free(m);
-    return -1;
+}
+
+int model_load(const char *path, model_t *m) {
+    memset(m, 0, sizeof *m);
+    snprintf(m->source, sizeof m->source, "%s", path);
+    int rc = path_is_gguf(path) ? model_load_gguf(path, m) : model_load_st(path, m);
+    if (!rc) rc = model_rope(m);
+    if (rc) model_free(m);
+    return rc;
 }
 
 void model_free(model_t *m) {
@@ -318,5 +497,6 @@ void model_free(model_t *m) {
     free(m->final_norm);
     free(m->rope_inv_freq);
     st_close(&m->st);
+    gguf_close(m->gguf);
     memset(m, 0, sizeof *m);
 }
