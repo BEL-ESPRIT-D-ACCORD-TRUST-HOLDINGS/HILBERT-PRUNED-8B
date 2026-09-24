@@ -45,12 +45,14 @@ static void usage(void) {
             "                                 (prompt version " PROMPT_VERSION_MEMORY "; needs --memory)\n"
             "                [--memory-meta JSON]        a JSON object stored with every entry\n"
             "                [--memory-vectors yes|no]   store each decision's final hidden state\n"
+            "                [--memory-clock START_US]   deterministic timestamps: entry n gets START_US + n\n"
             "score:          [--sign-key PREFIX.key]     after the run, sign the memory root into FILE.sigs\n");
 }
 
 typedef struct {
     const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor, *expected;
     const char *memory, *id, *proof, *root, *memory_meta, *key_out, *key, *public_key, *sign_key;
+    uint64_t memory_clock;
     bool memory_vectors;
     uint64_t from_us, to_us;
     bool has_from, has_to;
@@ -95,6 +97,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--last")) a->last = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--recall")) a->recall = (uint32_t)strtoul(v, NULL, 10);
         else if (!strcmp(k, "--memory-meta")) a->memory_meta = v;
+        else if (!strcmp(k, "--memory-clock")) a->memory_clock = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--key-out")) a->key_out = v;
         else if (!strcmp(k, "--key")) a->key = v;
         else if (!strcmp(k, "--public-key")) a->public_key = v;
@@ -434,6 +437,10 @@ static int open_engine(const args_t *a, engine_t *e, model_t *m) {
     if (a->memory && memory_open(a->memory, true, &e->memory)) {
         close_engine(e);
         return -1;
+    }
+    if (a->memory_clock && (!a->memory || memory_set_clock(e->memory, a->memory_clock))) {
+        close_engine(e);
+        return a->memory ? -1 : set_error("--memory-clock needs --memory");
     }
     return 0;
 }
