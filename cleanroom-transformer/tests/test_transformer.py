@@ -5,6 +5,7 @@ snapshot directory in TRANSFORMER_MODEL_DIR (tokenizer.json, chat_template.jinja
 and, for parity, torch + transformers.
 """
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -39,4 +40,12 @@ def test_parity_with_pytorch(binary):
     pytest.importorskip("transformers")
     done = subprocess.run([sys.executable, str(SM86 / "tools/parity.py"), "--binary", str(binary),
                            "--tokenizer", str(Path(MODEL_DIR) / "tokenizer.json")], capture_output=True, text=True)
+    assert done.returncode == 0, done.stdout + done.stderr
+
+
+@pytest.mark.skipif(shutil.which("java") is None or not os.environ.get("ALLOY_JAR"),
+                    reason="needs java and ALLOY_JAR pointing at an Alloy 6 jar")
+def test_formal_shape_contract(binary):
+    done = subprocess.run([sys.executable, str(SM86 / "tools/check_formal.py"), "--binary", str(binary),
+                           "--alloy", os.environ["ALLOY_JAR"]], capture_output=True, text=True)
     assert done.returncode == 0, done.stdout + done.stderr

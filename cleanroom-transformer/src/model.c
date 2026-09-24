@@ -187,6 +187,19 @@ static int bind_mat(binder_t *b, wmat_t *w, uint32_t rows, uint32_t cols, const 
     return 0;
 }
 
+/* Binds layer weight `name` with the [rows, cols] listed by layer_weights(). */
+static int bind_layer(binder_t *b, const config_t *c, uint32_t type, const char *name, wmat_t *w, int layer) {
+    weight_shape_t tab[16];
+    int n = layer_weights(c, type, tab, 16);
+    for (int k = 0; k < n; k++)
+        if (!strcmp(tab[k].name, name)) {
+            char fmt[160];
+            snprintf(fmt, sizeof fmt, "layers.%%d.%s", name);
+            return bind_mat(b, w, tab[k].rows, tab[k].cols, fmt, layer);
+        }
+    return set_error("weights: %s is not in the shape table", name);
+}
+
 static float *to_f32(const st_tensor_t *t, uint64_t count) {
     float *out = xmalloc(count * sizeof *out);
     for (uint64_t k = 0; k < count; k++) {
@@ -231,9 +244,8 @@ int model_load(const char *dir, model_t *m) {
         }
         m->lm_head = (wmat_t){t->dtype, c->vocab, c->hidden, t->data};
     }
-    const uint32_t H = c->hidden, I = c->intermediate, hd = c->head_dim;
-    const uint32_t Dk = c->lin_k_heads * c->lin_k_dim, Dv = c->lin_v_heads * c->lin_v_dim;
-    const uint32_t C = 2 * Dk + Dv;
+    const uint32_t H = c->hidden, hd = c->head_dim;
+    const uint32_t C = 2 * c->lin_k_heads * c->lin_k_dim + c->lin_v_heads * c->lin_v_dim;
     m->layers = xcalloc(c->n_layers, sizeof *m->layers);
     uint32_t n_full = 0, n_lin = 0;
     for (uint32_t l = 0; l < c->n_layers; l++) {
@@ -242,28 +254,27 @@ int model_load(const char *dir, model_t *m) {
         L->type = c->layer_type[l];
         if (bind_vec(&b, &L->in_norm, H, "layers.%d.input_layernorm.weight", i) ||
             bind_vec(&b, &L->post_norm, H, "layers.%d.post_attention_layernorm.weight", i) ||
-            bind_mat(&b, &L->gate, I, H, "layers.%d.mlp.gate_proj.weight", i) ||
-            bind_mat(&b, &L->up, I, H, "layers.%d.mlp.up_proj.weight", i) ||
-            bind_mat(&b, &L->down, H, I, "layers.%d.mlp.down_proj.weight", i))
+            bind_layer(&b, c, L->type, "mlp.gate_proj.weight", &L->gate, i) ||
+            bind_layer(&b, c, L->type, "mlp.up_proj.weight", &L->up, i) ||
+            bind_layer(&b, c, L->type, "mlp.down_proj.weight", &L->down, i))
             goto fail;
         if (L->type == LAYER_FULL) {
             L->slot = n_full++;
-            uint32_t qrows = c->n_heads * hd * (c->attn_gate ? 2 : 1);
-            if (bind_mat(&b, &L->q, qrows, H, "layers.%d.self_attn.q_proj.weight", i) ||
-                bind_mat(&b, &L->k, c->n_kv_heads * hd, H, "layers.%d.self_attn.k_proj.weight", i) ||
-                bind_mat(&b, &L->v, c->n_kv_heads * hd, H, "layers.%d.self_attn.v_proj.weight", i) ||
-                bind_mat(&b, &L->o, H, c->n_heads * hd, "layers.%d.self_attn.o_proj.weight", i))
+            if (bind_layer(&b, c, L->type, "self_attn.q_proj.weight", &L->q, i) ||
+                bind_layer(&b, c, L->type, "self_attn.k_proj.weight", &L->k, i) ||
+                bind_layer(&b, c, L->type, "self_attn.v_proj.weight", &L->v, i) ||
+                bind_layer(&b, c, L->type, "self_attn.o_proj.weight", &L->o, i))
                 goto fail;
             if (c->qk_norm && (bind_vec(&b, &L->q_norm, hd, "layers.%d.self_attn.q_norm.weight", i) ||
                                bind_vec(&b, &L->k_norm, hd, "layers.%d.self_attn.k_norm.weight", i)))
                 goto fail;
         } else {
             L->slot = n_lin++;
-            if (bind_mat(&b, &L->qkv, C, H, "layers.%d.linear_attn.in_proj_qkv.weight", i) ||
-                bind_mat(&b, &L->z, Dv, H, "layers.%d.linear_attn.in_proj_z.weight", i) ||
-                bind_mat(&b, &L->b, c->lin_v_heads, H, "layers.%d.linear_attn.in_proj_b.weight", i) ||
-                bind_mat(&b, &L->a, c->lin_v_heads, H, "layers.%d.linear_attn.in_proj_a.weight", i) ||
-                bind_mat(&b, &L->out, H, Dv, "layers.%d.linear_attn.out_proj.weight", i) ||
+            if (bind_layer(&b, c, L->type, "linear_attn.in_proj_qkv.weight", &L->qkv, i) ||
+                bind_layer(&b, c, L->type, "linear_attn.in_proj_z.weight", &L->z, i) ||
+                bind_layer(&b, c, L->type, "linear_attn.in_proj_b.weight", &L->b, i) ||
+                bind_layer(&b, c, L->type, "linear_attn.in_proj_a.weight", &L->a, i) ||
+                bind_layer(&b, c, L->type, "linear_attn.out_proj.weight", &L->out, i) ||
                 bind_vec(&b, &L->conv_w, (uint64_t)C * c->conv_k, "layers.%d.linear_attn.conv1d.weight", i) ||
                 bind_vec(&b, &L->A_log, c->lin_v_heads, "layers.%d.linear_attn.A_log", i) ||
                 bind_vec(&b, &L->dt_bias, c->lin_v_heads, "layers.%d.linear_attn.dt_bias", i) ||

@@ -223,6 +223,16 @@ Marks (`\p{M}`) count as punctuation, not letters. With
 `ignore_merges == true`, a piece that is already a vocabulary entry is
 emitted whole, before any merging.
 
+### 4.6 Shape contract
+
+Every per-layer weight is listed once, as `[rows = out, cols = in]` together
+with the activations it reads and writes (`layer_weights()` in `src/shapes.c`).
+The loader binds tensors from this table, and `cleanroom-transformer shapes`
+exports it. Every matrix multiply, including the per-head attention and
+DeltaNet contractions, must satisfy `MatmulSiphon` in
+`formal/FreehandTensorSiphon.als`. Head sharing (`j -> j / (many / few)`),
+RoPE pairing and the conv split must satisfy `formal/TransformerShapes.als`.
+
 ## 5. Readout
 
 `probabilities = softmax(option_logits)`, computed in double precision. They
