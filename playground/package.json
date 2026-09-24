@@ -1,0 +1,30 @@
+{
+  "name": "cleanroom-transformer-playground",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Browser playground for the cleanroom-transformer decision memory: a CLI replica on a freestanding WebAssembly core",
+  "type": "module",
+  "scripts": {
+    "build:core": "make -C core",
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "node --test tests/core.test.mjs tests/shell.test.mjs",
+    "test:ui": "node tests/ui.smoke.mjs"
+  },
+  "dependencies": {
+    "@cloudscape-design/components": "^3.0.1386",
+    "@cloudscape-design/design-tokens": "^3.0.113",
+    "@cloudscape-design/global-styles": "^1.0.70",
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.1.1",
+    "playwright-core": "^1.63.0",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.1"
+  }
+}

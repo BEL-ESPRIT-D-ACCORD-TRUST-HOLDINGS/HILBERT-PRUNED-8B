@@ -192,6 +192,7 @@ Returned probabilities are conditional on the supplied options. Calibrate and va
 - [EXL3 bridge](exl3-bridge/README.md) — quantized 27B runner and committed evidence
 - [Interactive replay](demo/index.html)
 - [Browser-only WebGPU demo](webgpu-demo/index.html) — no waitlist; use it today
+- [Decision memory playground](playground/README.md): the engine's `memory-*` commands in the browser, on a WebAssembly core
 - [Machine-readable summary](results/phase1-summary.json)
 - [Benchmark bundle](benchmarks/README.md) — fixtures, runners, selection IDs, and reproduction commands
 - [Raw results and checksums](results/raw/)

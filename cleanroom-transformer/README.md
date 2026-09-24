@@ -229,6 +229,9 @@ build/oqs/cleanroom-transformer memory-verify --proof sig.json --root ROOT --pub
   `check.sh` confirms that honest runs are accepted and eight kinds of
   forgery are rejected. Proving needs a Groth16 setup with a powers-of-tau
   file of at least 2^17 (for example the Hermez ceremony file).
+- **In a browser.** [`playground/`](../playground) runs the `memory-*`
+  commands on a freestanding WebAssembly build of this logic, with the same
+  output as this binary. It also has a Swift host.
 
 ## How it works
 
