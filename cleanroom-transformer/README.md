@@ -26,7 +26,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | GGUF loading | Verified on the CPU. All 13 supported quant formats dequantize bit-exactly against llama.cpp's reference. Tiny Llama GGUFs match PyTorch (F32) and transformers' GGUF loader (quantized) within 1e-6 relative. A released Llama 3 8B Instruct Q4_K_M file's tokenizer and prompts match Hugging Face on every row tested. **Not yet run with a full 8B GGUF** |
 | Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
 | Shape contract | Proven with Alloy. Every matrix multiply in the real Qwen3.5-4B and Llama 3 8B forward passes is a valid siphon in `formal/FreehandTensorSiphon.als`, and the head-sharing, RoPE and conv-split rules hold in bounded proofs (see Formal checks) |
-| CUDA forward pass | Compiles for sm_86 with no warnings. **Not yet run on a GPU.** Run `selftest` (below) before relying on it |
+| CUDA forward pass | Compiles for sm_86 with no warnings or register spills. **Not yet run on a GPU.** Run `selftest` (below) before relying on it. It also checks every quantized-weight kernel against the host decoder |
 
 ## Build
 
@@ -121,11 +121,16 @@ build/cleanroom-transformer-cuda score --model Meta-Llama-3-8B-Instruct-Q4_K_M.g
 - **Memory:** weights stay quantized in the memory-mapped file.
   - The CPU backend dequantizes each row as it uses it, which is slow but
     needs almost no extra RAM.
-  - The CUDA backend dequantizes to BF16 while uploading, so the GPU holds
-    the full BF16 model. An 8B model needs about 17 GB whatever the file's
-    quantization. That fits a 24 GB RTX 3090.
+  - The CUDA backend keeps quantized weights in their GGUF block format on
+    the GPU and decodes them inside the kernels. An 8B Q4_K_M file needs
+    about 5 GB of weights, plus a bf16 scratch buffer the size of the
+    largest weight (about 120 MB) and the attention cache.
+  - `--gpu-weights bf16` restores the old behaviour: every weight is
+    dequantized to BF16 while uploading (about 17 GB for 8B).
 - **Numerics:** the engine computes with the dequantized weights, as
-  `transformers` does when it loads a GGUF. llama.cpp itself multiplies
+  `transformers` does when it loads a GGUF. On the GPU, short inputs (under
+  32 tokens) use the weights decoded in float32. Longer inputs round them to
+  BF16 for the tensor cores, as the BF16 upload does. llama.cpp itself multiplies
   quantized weights with quantized activations, so its outputs differ
   slightly.
 - A partial download of a GGUF (just its header) is enough for `tokenize`,
@@ -167,6 +172,7 @@ calibrated confidence.
 | `src/tokenizer.c`, `src/unicode.c` | Tokenizer and Unicode normalization |
 | `src/safetensors.c`, `src/model.c` | Weight loading and model configuration |
 | `src/gguf.c` | GGUF reader and dequantizers |
+| `src/ggml_quant.h` | GGUF block decoding, shared by the CPU and GPU |
 | `src/cpu_backend.c` | Reference forward pass in float32 |
 | `src/cuda_backend.cu` | GPU forward pass and `selftest` |
 | `src/engine.c` | Scoring, including shared-context scoring |

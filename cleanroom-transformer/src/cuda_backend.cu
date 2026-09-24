@@ -1,4 +1,5 @@
 // cuda_backend.cu - decoder forward pass for sm_86 (RTX 30xx / A-series Ampere): Qwen3.5 hybrid and Llama.
+// GGUF quantized weights can stay in their block format on the GPU (see dmat_t).
 //
 // Mirrors cpu_backend.c (SPEC.md 4) kernel for kernel:
 //   - weights live on the device as bf16; activations are float32;
@@ -14,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "ggml_quant.h"
 #include "ops_common.h"
 #include "transformer.h"
 
@@ -30,6 +32,8 @@ typedef __nv_bfloat16 bf16;
 #define CKL() CK(cudaGetLastError())
 
 static const int CHUNK = 512;  // tokens per device pass; state carries across chunks
+
+static unsigned blocks(size_t n, unsigned per) { return (unsigned)((n + per - 1) / per); }
 
 // ------------------------------------------------------------------------------------ helpers
 static __device__ __forceinline__ float warp_sum(float v) {
@@ -418,11 +422,98 @@ __global__ void k_readout(const float *h, const bf16 *E, const uint32_t *ids, fl
     if (threadIdx.x == 0) out[blockIdx.x] = s;
 }
 
+// ---- GGUF quantized weights (block layouts in ggml_quant.h, shared with the host)
+// Sub-block u (32 values) of a quantized row starts in block u*32/per at sub-block u % (per/32).
+static __device__ __forceinline__ void deq_sub(const unsigned char *row, int type, uint32_t u, float *y) {
+    const uint32_t per = ggml_block_values(type);
+    ggml_dequant_sub32(type, row + (size_t)(u * 32 / per) * ggml_block_bytes(type), (int)(u % (per / 32)), y);
+}
+
+// Quantized [rows, cols] -> bf16, one thread per 32-value sub-block. Used before tensor-core GEMMs.
+__global__ void k_dequant_bf16(const unsigned char *q, int type, size_t row_bytes, uint32_t rows, uint32_t cols,
+                               bf16 *out) {
+    const size_t per_row = cols / 32, u = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (u >= (size_t)rows * per_row) return;
+    const size_t r = u / per_row, s = u % per_row;
+    float y[32];
+    deq_sub(q + r * row_bytes, type, (uint32_t)s, y);
+    bf16 *o = out + r * cols + s * 32;
+    for (int k = 0; k < 32; k++) o[k] = to_bf16(y[k]);
+}
+
+// Few-row GEMM on quantized weights: one warp per output column; each lane decodes 32-value
+// sub-blocks of that weight row in registers and dots them with up to 8 rows of A at a time.
+__global__ void __launch_bounds__(256) k_gemv_q(const bf16 *__restrict__ A, const unsigned char *__restrict__ W,
+                                                int type, size_t row_bytes, float *__restrict__ C, int M, int N, int K,
+                                                int accumulate) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 8 + warp;
+    if (n >= N) return;
+    const unsigned char *w = W + (size_t)n * row_bytes;
+    const int subs = K / 32;
+    for (int m0 = 0; m0 < M; m0 += 8) {
+        const int mc = M - m0 < 8 ? M - m0 : 8;
+        float s[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        for (int u = lane; u < subs; u += 32) {
+            float y[32];
+            deq_sub(w, type, (uint32_t)u, y);
+            for (int mi = 0; mi < 8; mi++) {
+                if (mi >= mc) break;
+                const uint4 *a = (const uint4 *)(A + (size_t)(m0 + mi) * K + (size_t)u * 32);
+                float p = 0.f;
+                for (int v = 0; v < 4; v++) {
+                    uint4 ar = a[v];
+                    const bf16 *av = (const bf16 *)&ar;
+                    for (int q = 0; q < 8; q++) p += y[v * 8 + q] * __bfloat162float(av[q]);
+                }
+                s[mi] += p;
+            }
+        }
+        for (int mi = 0; mi < mc; mi++) {
+            float v = warp_sum(s[mi]);
+            if (lane == 0) {
+                size_t o = (size_t)(m0 + mi) * N + n;
+                C[o] = accumulate ? C[o] + v : v;
+            }
+        }
+    }
+}
+
+// Embedding rows from a quantized table: one block per token.
+__global__ void k_embed_q(const unsigned char *E, int type, size_t row_bytes, const uint32_t *tok, float *x, int H) {
+    const int t = blockIdx.x;
+    const unsigned char *row = E + (size_t)tok[t] * row_bytes;
+    for (int u = threadIdx.x; u < H / 32; u += blockDim.x) deq_sub(row, type, (uint32_t)u, x + (size_t)t * H + u * 32);
+}
+
+// Readout logits from a quantized head: one block per id.
+__global__ void k_readout_q(const float *h, const unsigned char *E, int type, size_t row_bytes, const uint32_t *ids,
+                            float *out, int H) {
+    const unsigned char *row = E + (size_t)ids[blockIdx.x] * row_bytes;
+    float s = 0.f;
+    for (int u = threadIdx.x; u < H / 32; u += blockDim.x) {
+        float y[32];
+        deq_sub(row, type, (uint32_t)u, y);
+        for (int k = 0; k < 32; k++) s += h[u * 32 + k] * y[k];
+    }
+    s = block_sum(s);
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
+
 // ------------------------------------------------------------------------------------ backend
+// A device weight matrix [rows, cols]: dense bf16, or raw GGUF blocks with rows in Hugging Face order.
+typedef struct {
+    bf16 *bf;
+    unsigned char *q;
+    int type;
+    uint32_t rows, cols;
+    size_t row_bytes;
+} dmat_t;
+
 typedef struct {
     uint32_t type, slot;
     float *in_norm, *post_norm, *q_norm, *k_norm, *conv_w, *A_log, *dt_bias, *lin_norm;
-    bf16 *gate, *up, *down, *q, *k, *v, *o, *qkv, *z, *b, *a, *out;
+    dmat_t gate, up, down, q, k, v, o, qkv, z, b, a, out;
 } dlayer_t;
 
 typedef struct {
@@ -431,7 +522,10 @@ typedef struct {
     int device;
     cudaStream_t st;
     dlayer_t *L;
-    bf16 *embed, *lm_head;
+    dmat_t embed, lm_head;
+    bool keep_quantized;
+    bf16 *wscratch;       // one dequantized weight, for tensor-core GEMMs on quantized layers
+    size_t wscratch_elems;
     float *final_norm, *inv_freq;
     float **kc, **vc, **conv, **S, **conv_snap, **S_snap;
     size_t snap_pos;
@@ -455,7 +549,7 @@ static int upload_vec(cuda_t *c, float **dst, const float *src, size_t n) {
     return 0;
 }
 
-static int upload_mat(cuda_t *c, bf16 **dst, const wmat_t *w) {
+static int upload_bf16(cuda_t *c, bf16 **dst, const wmat_t *w) {
     size_t n = (size_t)w->rows * w->cols;
     if (dmalloc(c, (void **)dst, n * sizeof(bf16))) return -1;
     if (w->dtype == DT_BF16 && !w->perm_heads) {
@@ -482,6 +576,48 @@ static int upload_mat(cuda_t *c, bf16 **dst, const wmat_t *w) {
     free(tmp);
     free(row);
     return rc;
+}
+
+// Quantized GGUF weights stay in block form (rows reordered to Hugging Face order); everything else is bf16.
+// `gemm_operand`: the matrix feeds a GEMM, so the dequantization scratch must hold it.
+static int upload_mat(cuda_t *c, dmat_t *d, const wmat_t *w, bool gemm_operand) {
+    memset(d, 0, sizeof *d);
+    d->rows = w->rows;
+    d->cols = w->cols;
+    if (!(c->keep_quantized && w->dtype == DT_GGML && ggml_block_values(w->ggml_type) >= 32))
+        return upload_bf16(c, &d->bf, w);
+    d->type = w->ggml_type;
+    d->row_bytes = ggml_row_bytes(w->ggml_type, w->cols);
+    if (dmalloc(c, (void **)&d->q, d->row_bytes * w->rows)) return -1;
+    if (!w->perm_heads) {
+        CK(cudaMemcpy(d->q, w->data, d->row_bytes * w->rows, cudaMemcpyHostToDevice));
+    } else {
+        unsigned char *tmp = (unsigned char *)xmalloc(d->row_bytes * w->rows);
+        for (uint32_t r = 0; r < w->rows; r++)
+            memcpy(tmp + (size_t)r * d->row_bytes, (const unsigned char *)w->data + (size_t)wmat_src_row(w, r) * d->row_bytes,
+                   d->row_bytes);
+        cudaError_t e = cudaMemcpy(d->q, tmp, d->row_bytes * w->rows, cudaMemcpyHostToDevice);
+        free(tmp);
+        if (e != cudaSuccess) return set_error("CUDA upload failed: %s", cudaGetErrorString(e));
+    }
+    if (gemm_operand && (size_t)w->rows * w->cols > c->wscratch_elems) c->wscratch_elems = (size_t)w->rows * w->cols;
+    return 0;
+}
+
+// C[M,N] (+)= A[M,K] . W^T for either weight form.
+static int gemm_w(cuda_t *c, const bf16 *A, const dmat_t *W, float *C, int M, bool accumulate) {
+    const int N = (int)W->rows, K = (int)W->cols;
+    if (W->bf) return gemm(A, W->bf, C, M, N, K, accumulate, 0, c->st);
+    if (M < 32) {
+        k_gemv_q<<<(N + 7) / 8, 256, 0, c->st>>>(A, W->q, W->type, W->row_bytes, C, M, N, K, accumulate);
+        CKL();
+        return 0;
+    }
+    size_t units = (size_t)N * (K / 32);
+    k_dequant_bf16<<<blocks(units, 256), 256, 0, c->st>>>(W->q, W->type, W->row_bytes, (uint32_t)N, (uint32_t)K,
+                                                          c->wscratch);
+    CKL();
+    return gemm(A, c->wscratch, C, M, N, K, accumulate, 0, c->st);
 }
 
 static size_t conv_dim(const config_t *cfg) {
@@ -533,8 +669,6 @@ static int cu_restore(backend_t *b) {
     return 0;
 }
 
-static unsigned blocks(size_t n, unsigned per) { return (unsigned)((n + per - 1) / per); }
-
 static int launch_attention(cuda_t *c, const float *q, const float *kc, const float *vc, const float *qg, int T,
                             int pos0, int qstride) {
     const config_t *cfg = &c->m->cfg;
@@ -556,9 +690,9 @@ static int run_layers(cuda_t *c, int T, int pos0) {
     const config_t *cfg = &c->m->cfg;
     const int H = (int)cfg->hidden, I = (int)cfg->intermediate;
     const int nh = (int)cfg->n_heads, nkv = (int)cfg->n_kv_heads, hd = (int)cfg->head_dim;
-    const int qw = nh * hd * (cfg->attn_gate ? 2 : 1), kvw = nkv * hd;
+    const int qw = nh * hd * (cfg->attn_gate ? 2 : 1);
     const int nk = (int)cfg->lin_k_heads, nv = (int)cfg->lin_v_heads, dk = (int)cfg->lin_k_dim, dv = (int)cfg->lin_v_dim;
-    const int Dk = nk * dk, Dv = nv * dv, C = (int)conv_dim(cfg), K = (int)cfg->conv_k;
+    const int Dk = nk * dk, C = (int)conv_dim(cfg), K = (int)cfg->conv_k;
     cudaStream_t st = c->st;
     for (uint32_t li = 0; li < cfg->n_layers; li++) {
         const dlayer_t *L = &c->L[li];
@@ -566,22 +700,22 @@ static int run_layers(cuda_t *c, int T, int pos0) {
         CKL();
         if (L->type == LAYER_FULL) {
             // f0 = [q|gate], f1 = roped q then v, f2 = k, hb = gated attention output
-            if (gemm(c->hb, L->q, c->f0, T, qw, H, false, 0, st) || gemm(c->hb, L->k, c->f2, T, kvw, H, false, 0, st))
+            if (gemm_w(c, c->hb, &L->q, c->f0, T, false) || gemm_w(c, c->hb, &L->k, c->f2, T, false))
                 return -1;
             float *vbuf = c->f1 + (size_t)T * nh * hd;  // v staged after q
-            if (gemm(c->hb, L->v, vbuf, T, kvw, H, false, 0, st)) return -1;
+            if (gemm_w(c, c->hb, &L->v, vbuf, T, false)) return -1;
             dim3 g2(T, nh + nkv);
             k_qk_norm_rope<<<g2, 128, hd * sizeof(float), st>>>(c->f0, c->f2, vbuf, L->q_norm, L->k_norm, cfg->norm_offset, c->inv_freq,
                                                               c->f1, c->kc[L->slot], c->vc[L->slot], nh, nkv, hd,
                                                               (int)cfg->rot_dim, qw, pos0, cfg->eps);
             CKL();
             if (launch_attention(c, c->f1, c->kc[L->slot], c->vc[L->slot], c->f0, T, pos0, qw)) return -1;
-            if (gemm(c->hb, L->o, c->x, T, H, nh * hd, true, 0, st)) return -1;
+            if (gemm_w(c, c->hb, &L->o, c->x, T, true)) return -1;
         } else {
             // f0 = u (conv input), f1 = conv output (q|k|v), f2 = z, f3 = b|a, f4 = core output
             float *bb = c->f3, *aa = c->f3 + (size_t)T * nv;
-            if (gemm(c->hb, L->qkv, c->f0, T, C, H, false, 0, st) || gemm(c->hb, L->z, c->f2, T, Dv, H, false, 0, st) ||
-                gemm(c->hb, L->b, bb, T, nv, H, false, 0, st) || gemm(c->hb, L->a, aa, T, nv, H, false, 0, st))
+            if (gemm_w(c, c->hb, &L->qkv, c->f0, T, false) || gemm_w(c, c->hb, &L->z, c->f2, T, false) ||
+                gemm_w(c, c->hb, &L->b, bb, T, false) || gemm_w(c, c->hb, &L->a, aa, T, false))
                 return -1;
             k_conv_silu<<<blocks((size_t)T * C, 256), 256, 0, st>>>(c->f0, c->conv[L->slot], L->conv_w, c->f1, T, C, K);
             CKL();
@@ -601,15 +735,15 @@ static int run_layers(cuda_t *c, int T, int pos0) {
             CKL();
             k_gated_norm<<<dim3(T, nv), 128, 0, st>>>(c->f4, c->f2, L->lin_norm, c->hb, dv, cfg->eps);
             CKL();
-            if (gemm(c->hb, L->out, c->x, T, H, Dv, true, 0, st)) return -1;
+            if (gemm_w(c, c->hb, &L->out, c->x, T, true)) return -1;
         }
         k_rmsnorm<bf16><<<T, 256, 0, st>>>(c->x, L->post_norm, cfg->norm_offset, c->hb, H, cfg->eps);
         CKL();
-        if (gemm(c->hb, L->gate, c->f0, T, I, H, false, 0, st) || gemm(c->hb, L->up, c->f1, T, I, H, false, 0, st))
+        if (gemm_w(c, c->hb, &L->gate, c->f0, T, false) || gemm_w(c, c->hb, &L->up, c->f1, T, false))
             return -1;
         k_swiglu<<<blocks((size_t)T * I, 256), 256, 0, st>>>(c->f0, c->f1, c->hb, (size_t)T * I);
         CKL();
-        if (gemm(c->hb, L->down, c->x, T, H, I, true, 0, st)) return -1;
+        if (gemm_w(c, c->hb, &L->down, c->x, T, true)) return -1;
     }
     return 0;
 }
@@ -631,7 +765,8 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
     for (size_t c0 = 0; c0 < n; c0 += CHUNK) {
         int T = (int)(n - c0 < (size_t)CHUNK ? n - c0 : (size_t)CHUNK);
         CK(cudaMemcpyAsync(c->d_tok, tokens + c0, T * sizeof(uint32_t), cudaMemcpyHostToDevice, c->st));
-        k_embed<<<T, 256, 0, c->st>>>(c->embed, c->d_tok, c->x, H);
+        if (c->embed.bf) k_embed<<<T, 256, 0, c->st>>>(c->embed.bf, c->d_tok, c->x, H);
+        else k_embed_q<<<T, 128, 0, c->st>>>(c->embed.q, c->embed.type, c->embed.row_bytes, c->d_tok, c->x, H);
         CKL();
         if (run_layers(c, T, (int)b->pos)) return -1;
         b->pos += (size_t)T;
@@ -642,7 +777,9 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
     CKL();
     if (n_ids) {
         CK(cudaMemcpyAsync(c->d_ids, ids, n_ids * sizeof(uint32_t), cudaMemcpyHostToDevice, c->st));
-        k_readout<<<n_ids, 256, 0, c->st>>>(c->hfin, c->lm_head, c->d_ids, c->d_logits, H);
+        if (c->lm_head.bf) k_readout<<<n_ids, 256, 0, c->st>>>(c->hfin, c->lm_head.bf, c->d_ids, c->d_logits, H);
+        else k_readout_q<<<n_ids, 128, 0, c->st>>>(c->hfin, c->lm_head.q, c->lm_head.type, c->lm_head.row_bytes,
+                                                   c->d_ids, c->d_logits, H);
         CKL();
         CK(cudaMemcpyAsync(logits, c->d_logits, n_ids * sizeof(float), cudaMemcpyDeviceToHost, c->st));
     }
@@ -672,9 +809,9 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
     if (prop.major < 8) return set_error("cuda: %s is sm_%d%d; bf16 tensor cores need sm_80+ (built for sm_86)",
                                           prop.name, prop.major, prop.minor);
     CK(cudaStreamCreate(&c->st));
-    if (upload_mat(c, &c->embed, &m->embed)) return -1;
+    if (upload_mat(c, &c->embed, &m->embed, false)) return -1;
     if (cfg->tied) c->lm_head = c->embed;
-    else if (upload_mat(c, &c->lm_head, &m->lm_head)) return -1;
+    else if (upload_mat(c, &c->lm_head, &m->lm_head, false)) return -1;
     if (upload_vec(c, &c->final_norm, m->final_norm, cfg->hidden) ||
         upload_vec(c, &c->inv_freq, m->rope_inv_freq, cfg->rot_dim / 2))
         return -1;
@@ -686,17 +823,19 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
         d->type = s->type;
         d->slot = s->slot;
         if (upload_vec(c, &d->in_norm, s->in_norm, H) || upload_vec(c, &d->post_norm, s->post_norm, H) ||
-            upload_mat(c, &d->gate, &s->gate) || upload_mat(c, &d->up, &s->up) || upload_mat(c, &d->down, &s->down))
+            upload_mat(c, &d->gate, &s->gate, true) || upload_mat(c, &d->up, &s->up, true) ||
+            upload_mat(c, &d->down, &s->down, true))
             return -1;
         if (s->type == LAYER_FULL) {
-            if (upload_mat(c, &d->q, &s->q) || upload_mat(c, &d->k, &s->k) || upload_mat(c, &d->v, &s->v) ||
-                upload_mat(c, &d->o, &s->o))
+            if (upload_mat(c, &d->q, &s->q, true) || upload_mat(c, &d->k, &s->k, true) ||
+                upload_mat(c, &d->v, &s->v, true) || upload_mat(c, &d->o, &s->o, true))
                 return -1;
             if (cfg->qk_norm && (upload_vec(c, &d->q_norm, s->q_norm, hd) || upload_vec(c, &d->k_norm, s->k_norm, hd)))
                 return -1;
         } else {
-            if (upload_mat(c, &d->qkv, &s->qkv) || upload_mat(c, &d->z, &s->z) || upload_mat(c, &d->b, &s->b) ||
-                upload_mat(c, &d->a, &s->a) || upload_mat(c, &d->out, &s->out) ||
+            if (upload_mat(c, &d->qkv, &s->qkv, true) || upload_mat(c, &d->z, &s->z, true) ||
+                upload_mat(c, &d->b, &s->b, true) || upload_mat(c, &d->a, &s->a, true) ||
+                upload_mat(c, &d->out, &s->out, true) ||
                 upload_vec(c, &d->conv_w, s->conv_w, C * K) || upload_vec(c, &d->A_log, s->A_log, cfg->lin_v_heads) ||
                 upload_vec(c, &d->dt_bias, s->dt_bias, cfg->lin_v_heads) ||
                 upload_vec(c, &d->lin_norm, s->lin_norm, cfg->lin_v_dim))
@@ -704,6 +843,7 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
         }
     }
     size_t weights = c->bytes;
+    if (c->wscratch_elems && dmalloc(c, (void **)&c->wscratch, c->wscratch_elems * sizeof(bf16))) return -1;
     const size_t kvw = (size_t)cfg->n_kv_heads * hd;
     c->kc = (float **)xcalloc(cfg->n_full + 1, sizeof(float *));
     c->vc = (float **)xcalloc(cfg->n_full + 1, sizeof(float *));
@@ -739,16 +879,18 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
         dmalloc(c, (void **)&c->d_tok, CHUNK * sizeof(uint32_t)) || dmalloc(c, (void **)&c->d_ids, 64 * sizeof(uint32_t)) ||
         dmalloc(c, (void **)&c->d_logits, 64 * sizeof(float)))
         return -1;
-    fprintf(stderr, "cleanroom-transformer: %s (sm_%d%d), weights %.2f GiB, state+scratch %.2f GiB, context %zu\n", prop.name,
-            prop.major, prop.minor, weights / 1073741824.0, (c->bytes - weights) / 1073741824.0, max_seq);
+    fprintf(stderr, "cleanroom-transformer: %s (sm_%d%d), weights %.2f GiB (%s), state+scratch %.2f GiB, context %zu\n",
+            prop.name, prop.major, prop.minor, weights / 1073741824.0, c->wscratch ? "GGUF blocks kept quantized" : "bf16",
+            (c->bytes - weights) / 1073741824.0, max_seq);
     return 0;
 }
 
-extern "C" backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device) {
+extern "C" backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device, bool keep_quantized) {
     cuda_t *c = (cuda_t *)xcalloc(1, sizeof *c);
     c->m = m;
     c->device = device;
-    c->base.name = "cuda-bf16";
+    c->keep_quantized = keep_quantized;
+    c->base.name = keep_quantized && m->gguf ? "cuda-gguf-quantized" : "cuda-bf16";
     c->base.reset = cu_reset;
     c->base.forward = cu_forward;
     c->base.snapshot = cu_snapshot;
@@ -820,6 +962,124 @@ static int selftest_gemm(int verbose, int *failed) {
     return 0;
 }
 
+// Every quantized kernel against the host decoder (itself bit-exact with llama.cpp's reference).
+static int selftest_quant(int verbose, int *failed) {
+    struct { int type; const char *name; int scales[2]; } kinds[] = {
+        {GGML_Q4_0, "Q4_0", {0, -1}}, {GGML_Q4_1, "Q4_1", {0, 2}}, {GGML_Q5_0, "Q5_0", {0, -1}},
+        {GGML_Q5_1, "Q5_1", {0, 2}}, {GGML_Q8_0, "Q8_0", {0, -1}}, {GGML_Q2_K, "Q2_K", {80, 82}},
+        {GGML_Q3_K, "Q3_K", {108, -1}}, {GGML_Q4_K, "Q4_K", {0, 2}}, {GGML_Q5_K, "Q5_K", {0, 2}},
+        {GGML_Q6_K, "Q6_K", {208, -1}},
+    };
+    const int N = 40, K = 512, Ms[] = {5, 40};
+    uint64_t seed = 99;
+    cuda_t c;
+    memset(&c, 0, sizeof c);
+    c.wscratch_elems = (size_t)N * K;
+    CK(cudaMalloc(&c.wscratch, c.wscratch_elems * sizeof(bf16)));
+    for (size_t ki = 0; ki < sizeof kinds / sizeof *kinds; ki++) {
+        const int type = kinds[ki].type;
+        const size_t rb = ggml_row_bytes(type, K), nb = rb / ggml_block_bytes(type);
+        unsigned char *hq = (unsigned char *)xmalloc(rb * N);
+        for (size_t i = 0; i < rb * N; i++) hq[i] = (unsigned char)lcg(&seed);
+        for (size_t blk = 0; blk < nb * N; blk++)
+            for (int f = 0; f < 2; f++)
+                if (kinds[ki].scales[f] >= 0) {  // keep scales finite and small
+                    uint16_t h = f32_to_bf16(0.0f);
+                    float v = (0.2f + 0.8f * (float)(lcg(&seed) % 1000) / 1000.0f) * 0.02f;
+                    // float -> fp16 (normal range only)
+                    uint32_t u;
+                    memcpy(&u, &v, 4);
+                    h = (uint16_t)(((u >> 16) & 0x8000) | ((((u >> 23) & 0xff) - 112) << 10) | ((u >> 13) & 0x3ff));
+                    unsigned char *p = hq + blk * ggml_block_bytes(type) + kinds[ki].scales[f];
+                    p[0] = (unsigned char)h, p[1] = (unsigned char)(h >> 8);
+                }
+        float *ref = (float *)xmalloc(sizeof(float) * N * K);
+        for (int r = 0; r < N; r++) ggml_dequantize_row(type, hq + r * rb, ref + (size_t)r * K, K);
+        dmat_t W;
+        memset(&W, 0, sizeof W);
+        W.type = type, W.rows = N, W.cols = K, W.row_bytes = rb;
+        CK(cudaMalloc(&W.q, rb * N));
+        CK(cudaMemcpy(W.q, hq, rb * N, cudaMemcpyHostToDevice));
+        // dequantize to bf16
+        bf16 *dq;
+        CK(cudaMalloc(&dq, sizeof(bf16) * N * K));
+        k_dequant_bf16<<<blocks((size_t)N * K / 32, 256), 256>>>(W.q, type, rb, N, K, dq);
+        CKL();
+        uint16_t *hb = (uint16_t *)xmalloc(sizeof(uint16_t) * N * K);
+        CK(cudaMemcpy(hb, dq, sizeof(uint16_t) * N * K, cudaMemcpyDeviceToHost));
+        double worst = 0;
+        for (int i = 0; i < N * K; i++)
+            worst = fmax(worst, fabs(bf16_to_f32(hb[i]) - ref[i]) / (fabs(ref[i]) + 1e-6));
+        bool ok = worst <= 1.0 / 128;  // one bf16 rounding step
+        if (!ok) (*failed)++;
+        if (verbose || !ok) printf("  %-5s dequantize->bf16          max rel err %.2e  %s\n", kinds[ki].name, worst, ok ? "ok" : "FAIL");
+        // GEMV (M < 32, in-register decode) and GEMM (M >= 32, bf16 scratch + tensor cores)
+        for (int mi = 0; mi < 2; mi++) {
+            const int M = Ms[mi];
+            uint16_t *hA = (uint16_t *)xmalloc(sizeof(uint16_t) * M * K);
+            for (int i = 0; i < M * K; i++) hA[i] = f32_to_bf16(rnd(&seed));
+            bf16 *dA;
+            float *dC, *hC = (float *)xmalloc(sizeof(float) * M * N);
+            CK(cudaMalloc(&dA, sizeof(bf16) * M * K));
+            CK(cudaMalloc(&dC, sizeof(float) * M * N));
+            CK(cudaMemcpy(dA, hA, sizeof(bf16) * M * K, cudaMemcpyHostToDevice));
+            if (gemm_w(&c, dA, &W, dC, M, false)) return -1;
+            CK(cudaMemcpy(hC, dC, sizeof(float) * M * N, cudaMemcpyDeviceToHost));
+            double err = 0, scale = 1e-6;
+            for (int m = 0; m < M; m++)
+                for (int n = 0; n < N; n++) {
+                    double acc = 0;
+                    for (int k = 0; k < K; k++) acc += (double)bf16_to_f32(hA[m * K + k]) * ref[(size_t)n * K + k];
+                    err = fmax(err, fabs(acc - hC[m * N + n]));
+                    scale = fmax(scale, fabs(acc));
+                }
+            // GEMV decodes in float32; the GEMM path rounds weights to bf16 first
+            double tol = M < 32 ? 1e-4 : 2e-2;
+            ok = err / scale <= tol;
+            if (!ok) (*failed)++;
+            if (verbose || !ok)
+                printf("  %-5s %s M=%-3d               max rel err %.2e  %s\n", kinds[ki].name,
+                       M < 32 ? "gemv (quantized)   " : "gemm (bf16 scratch)", M, err / scale, ok ? "ok" : "FAIL");
+            cudaFree(dA), cudaFree(dC);
+            free(hA), free(hC);
+        }
+        // embedding lookup and readout directly from blocks
+        uint32_t ids[3] = {0, 17, (uint32_t)(N - 1)}, *d_ids;
+        float h[K], *d_h, *d_out, out[3], *d_x, x[3 * K];
+        for (int k = 0; k < K; k++) h[k] = rnd(&seed);
+        CK(cudaMalloc(&d_ids, sizeof ids));
+        CK(cudaMalloc(&d_h, sizeof h));
+        CK(cudaMalloc(&d_out, sizeof out));
+        CK(cudaMalloc(&d_x, sizeof x));
+        CK(cudaMemcpy(d_ids, ids, sizeof ids, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_h, h, sizeof h, cudaMemcpyHostToDevice));
+        k_embed_q<<<3, 128>>>(W.q, type, rb, d_ids, d_x, K);
+        k_readout_q<<<3, 128>>>(d_h, W.q, type, rb, d_ids, d_out, K);
+        CKL();
+        CK(cudaMemcpy(x, d_x, sizeof x, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(out, d_out, sizeof out, cudaMemcpyDeviceToHost));
+        double ew = 0, rw = 0, rs = 1e-6;
+        for (int t = 0; t < 3; t++) {
+            double acc = 0;
+            for (int k = 0; k < K; k++) {
+                ew = fmax(ew, fabs(x[t * K + k] - ref[(size_t)ids[t] * K + k]) / (fabs(ref[(size_t)ids[t] * K + k]) + 1e-6));
+                acc += (double)h[k] * ref[(size_t)ids[t] * K + k];
+            }
+            rw = fmax(rw, fabs(acc - out[t]));
+            rs = fmax(rs, fabs(acc));
+        }
+        ok = ew <= 1e-5 && rw / rs <= 1e-4;
+        if (!ok) (*failed)++;
+        if (verbose || !ok)
+            printf("  %-5s embed + readout            max rel err %.2e / %.2e  %s\n", kinds[ki].name, ew, rw / rs,
+                   ok ? "ok" : "FAIL");
+        cudaFree(d_ids), cudaFree(d_h), cudaFree(d_out), cudaFree(d_x), cudaFree(dq), cudaFree(W.q);
+        free(hq), free(ref), free(hb);
+    }
+    cudaFree(c.wscratch);
+    return 0;
+}
+
 static void compare(const char *what, const float *ref, const float *got, uint32_t n, int *failed) {
     double worst = 0, scale = 1, pr = 0, pg = 0, mr = ref[0], mg = got[0];
     uint32_t ar = 0, ag = 0;
@@ -844,6 +1104,8 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
     CK(cudaSetDevice(device));
     printf("GEMM kernels vs host double reference:\n");
     if (selftest_gemm(verbose, &failed)) return -1;
+    printf("GGUF quantized kernels vs host decoder:\n");
+    if (selftest_quant(verbose, &failed)) return -1;
     if (n_tokens < 2) n_tokens = 2;
     const config_t *cfg = &m->cfg;
     uint64_t seed = 7;
@@ -863,7 +1125,7 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
         return -1;
     }
     size_t ctx = n_tokens > 2048 ? n_tokens : 2048;
-    backend_t *gpu = cuda_backend_create(m, ctx, device);
+    backend_t *gpu = cuda_backend_create(m, ctx, device, true);
     if (!gpu) {
         free(tok);
         return -1;

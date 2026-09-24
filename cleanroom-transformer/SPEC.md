@@ -250,6 +250,15 @@ A `.gguf` file (version 2 or 3; magic `GGUF`) is read as follows.
 - **Dequantization.** Formats follow ggml's block layouts (Q4_0 through
   Q8_0 with 32-value blocks; Q2_K through Q6_K with 256-value super-blocks).
   Rows are dequantized to float32 exactly as `gguf.quants.dequantize` does.
+- **Quantized weights on the GPU.** By default the CUDA backend uploads
+  each quantized matrix in its GGUF block format, with query/key rows already
+  in Hugging Face order. Blocks are decoded 32 values at a time by the same
+  code as the host (`src/ggml_quant.h`). With fewer than 32 activation rows
+  the multiply decodes weights in registers and accumulates in float32. With
+  32 or more rows the weight is first decoded into a bf16 scratch buffer and
+  multiplied on tensor cores, which matches the bf16 upload. Embedding and
+  readout rows are decoded directly from blocks. F32, F16 and BF16 tensors
+  are uploaded as bf16. `--gpu-weights bf16` uploads every weight as bf16.
 
 ### 4.6 Shape contract
 

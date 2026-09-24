@@ -17,7 +17,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "ops_common.h"
+#include "ggml_quant.h"
 
 enum { GV_U8, GV_I8, GV_U16, GV_I16, GV_U32, GV_I32, GV_F32, GV_BOOL, GV_STR, GV_ARR, GV_U64, GV_I64, GV_F64 };
 
@@ -38,185 +38,22 @@ struct gguf {
     size_t data_off;
 };
 
-/* ------------------------------------------------------------ block types */
-typedef struct {
-    int type;
-    const char *name;
-    uint32_t block;  /* values per block */
-    uint32_t bytes;  /* bytes per block */
-} gtype_t;
-
-static const gtype_t GTYPES[] = {
-    {GGML_F32, "F32", 1, 4},       {GGML_F16, "F16", 1, 2},       {GGML_Q4_0, "Q4_0", 32, 18},
-    {GGML_Q4_1, "Q4_1", 32, 20},   {GGML_Q5_0, "Q5_0", 32, 22},   {GGML_Q5_1, "Q5_1", 32, 24},
-    {GGML_Q8_0, "Q8_0", 32, 34},   {GGML_Q2_K, "Q2_K", 256, 84},  {GGML_Q3_K, "Q3_K", 256, 110},
-    {GGML_Q4_K, "Q4_K", 256, 144}, {GGML_Q5_K, "Q5_K", 256, 176}, {GGML_Q6_K, "Q6_K", 256, 210},
-    {GGML_BF16, "BF16", 1, 2},
+static const char *NAMES[][2] = {
+    {"0", "F32"}, {"1", "F16"}, {"2", "Q4_0"}, {"3", "Q4_1"}, {"6", "Q5_0"}, {"7", "Q5_1"}, {"8", "Q8_0"},
+    {"10", "Q2_K"}, {"11", "Q3_K"}, {"12", "Q4_K"}, {"13", "Q5_K"}, {"14", "Q6_K"}, {"30", "BF16"},
 };
 
-static const gtype_t *gtype(int type) {
-    for (size_t k = 0; k < sizeof GTYPES / sizeof *GTYPES; k++)
-        if (GTYPES[k].type == type) return &GTYPES[k];
-    return NULL;
-}
-
 const char *ggml_type_name(int type) {
-    const gtype_t *t = gtype(type);
-    return t ? t->name : "unsupported";
+    char id[8];
+    snprintf(id, sizeof id, "%d", type);
+    for (size_t k = 0; k < sizeof NAMES / sizeof *NAMES; k++)
+        if (!strcmp(NAMES[k][0], id)) return NAMES[k][1];
+    return "unsupported";
 }
 
 size_t ggml_row_bytes(int type, uint64_t cols) {
-    const gtype_t *t = gtype(type);
-    return t ? (size_t)(cols / t->block) * t->bytes : 0;
-}
-
-/* ------------------------------------------------------------- dequantize */
-static float h2f(const unsigned char *p) { return f16_to_f32((uint16_t)(p[0] | p[1] << 8)); }
-
-static void get_scale_min_k4(int j, const unsigned char *q, uint8_t *d, uint8_t *m) {
-    if (j < 4) {
-        *d = q[j] & 63;
-        *m = q[j + 4] & 63;
-    } else {
-        *d = (uint8_t)((q[j + 4] & 0xF) | ((q[j - 4] >> 6) << 4));
-        *m = (uint8_t)((q[j + 4] >> 4) | ((q[j] >> 6) << 4));
-    }
-}
-
-static void deq_block(int type, const unsigned char *b, float *y) {
-    switch (type) {
-    case GGML_Q4_0: {
-        float d = h2f(b);
-        for (int j = 0; j < 16; j++) {
-            y[j] = (float)((b[2 + j] & 0xF) - 8) * d;
-            y[j + 16] = (float)((b[2 + j] >> 4) - 8) * d;
-        }
-        break;
-    }
-    case GGML_Q4_1: {
-        float d = h2f(b), m = h2f(b + 2);
-        for (int j = 0; j < 16; j++) {
-            y[j] = (float)(b[4 + j] & 0xF) * d + m;
-            y[j + 16] = (float)(b[4 + j] >> 4) * d + m;
-        }
-        break;
-    }
-    case GGML_Q5_0:
-    case GGML_Q5_1: {
-        bool one = type == GGML_Q5_1;
-        float d = h2f(b), m = one ? h2f(b + 2) : 0.0f;
-        const unsigned char *qhp = b + (one ? 4 : 2), *qs = qhp + 4;
-        uint32_t qh = (uint32_t)qhp[0] | (uint32_t)qhp[1] << 8 | (uint32_t)qhp[2] << 16 | (uint32_t)qhp[3] << 24;
-        for (int j = 0; j < 16; j++) {
-            int h0 = (int)(((qh >> j) << 4) & 0x10), h1 = (int)((qh >> (j + 12)) & 0x10);
-            int x0 = (qs[j] & 0xF) | h0, x1 = (qs[j] >> 4) | h1;
-            y[j] = one ? (float)x0 * d + m : (float)(x0 - 16) * d;
-            y[j + 16] = one ? (float)x1 * d + m : (float)(x1 - 16) * d;
-        }
-        break;
-    }
-    case GGML_Q8_0: {
-        float d = h2f(b);
-        for (int j = 0; j < 32; j++) y[j] = (float)(int8_t)b[2 + j] * d;
-        break;
-    }
-    case GGML_Q2_K: {
-        const unsigned char *sc = b, *q = b + 16;
-        float d = h2f(b + 80), mn = h2f(b + 82);
-        int is = 0;
-        for (int n = 0; n < 256; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                uint8_t s = sc[is++];
-                float dl = d * (s & 0xF), ml = mn * (s >> 4);
-                for (int l = 0; l < 16; l++) *y++ = dl * (float)((q[l] >> shift) & 3) - ml;
-                s = sc[is++];
-                dl = d * (s & 0xF), ml = mn * (s >> 4);
-                for (int l = 0; l < 16; l++) *y++ = dl * (float)((q[l + 16] >> shift) & 3) - ml;
-                shift += 2;
-            }
-            q += 32;
-        }
-        break;
-    }
-    case GGML_Q3_K: {
-        const unsigned char *hm = b, *q = b + 32, *raw = b + 96;
-        float d = h2f(b + 108);
-        uint32_t aux[4];
-        memcpy(aux, raw, 12);
-        const uint32_t km1 = 0x03030303, km2 = 0x0f0f0f0f;
-        uint32_t tmp = aux[2];
-        aux[2] = ((aux[0] >> 4) & km2) | (((tmp >> 4) & km1) << 4);
-        aux[3] = ((aux[1] >> 4) & km2) | (((tmp >> 6) & km1) << 4);
-        aux[0] = (aux[0] & km2) | (((tmp >> 0) & km1) << 4);
-        aux[1] = (aux[1] & km2) | (((tmp >> 2) & km1) << 4);
-        const int8_t *scales = (const int8_t *)aux;
-        int is = 0;
-        uint8_t m = 1;
-        for (int n = 0; n < 256; n += 128) {
-            int shift = 0;
-            for (int j = 0; j < 4; j++) {
-                float dl = d * (float)(scales[is++] - 32);
-                for (int l = 0; l < 16; l++)
-                    *y++ = dl * (float)((int8_t)((q[l] >> shift) & 3) - ((hm[l] & m) ? 0 : 4));
-                dl = d * (float)(scales[is++] - 32);
-                for (int l = 0; l < 16; l++)
-                    *y++ = dl * (float)((int8_t)((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
-                shift += 2;
-                m <<= 1;
-            }
-            q += 32;
-        }
-        break;
-    }
-    case GGML_Q4_K:
-    case GGML_Q5_K: {
-        bool five = type == GGML_Q5_K;
-        float d = h2f(b), mn = h2f(b + 2);
-        const unsigned char *sc = b + 4, *qh = b + 16, *ql = b + (five ? 48 : 16);
-        uint8_t u1 = 1, u2 = 2;
-        int is = 0;
-        for (int j = 0; j < 256; j += 64) {
-            uint8_t s, m;
-            get_scale_min_k4(is, sc, &s, &m);
-            float d1 = d * s, m1 = mn * m;
-            get_scale_min_k4(is + 1, sc, &s, &m);
-            float d2 = d * s, m2 = mn * m;
-            for (int l = 0; l < 32; l++)
-                *y++ = d1 * (float)((ql[l] & 0xF) + (five && (qh[l] & u1) ? 16 : 0)) - m1;
-            for (int l = 0; l < 32; l++)
-                *y++ = d2 * (float)((ql[l] >> 4) + (five && (qh[l] & u2) ? 16 : 0)) - m2;
-            ql += 32;
-            is += 2;
-            u1 <<= 2;
-            u2 <<= 2;
-        }
-        break;
-    }
-    case GGML_Q6_K: {
-        const unsigned char *ql = b, *qh = b + 128;
-        const int8_t *sc = (const int8_t *)(b + 192);
-        float d = h2f(b + 208);
-        for (int n = 0; n < 256; n += 128) {
-            for (int l = 0; l < 32; l++) {
-                int is = l / 16;
-                int q1 = (int8_t)((ql[l] & 0xF) | (((qh[l] >> 0) & 3) << 4)) - 32;
-                int q2 = (int8_t)((ql[l + 32] & 0xF) | (((qh[l] >> 2) & 3) << 4)) - 32;
-                int q3 = (int8_t)((ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4)) - 32;
-                int q4 = (int8_t)((ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4)) - 32;
-                y[l] = d * sc[is] * q1;
-                y[l + 32] = d * sc[is + 2] * q2;
-                y[l + 64] = d * sc[is + 4] * q3;
-                y[l + 96] = d * sc[is + 6] * q4;
-            }
-            y += 128;
-            ql += 64;
-            qh += 32;
-            sc += 8;
-        }
-        break;
-    }
-    }
+    uint32_t v = ggml_block_values(type);
+    return v ? (size_t)(cols / v) * ggml_block_bytes(type) : 0;
 }
 
 void ggml_dequantize_row(int type, const void *src, float *out, uint64_t cols) {
@@ -224,14 +61,15 @@ void ggml_dequantize_row(int type, const void *src, float *out, uint64_t cols) {
     switch (type) {
     case GGML_F32: memcpy(out, p, cols * 4); return;
     case GGML_F16:
-        for (uint64_t k = 0; k < cols; k++) out[k] = h2f(p + 2 * k);
+        for (uint64_t k = 0; k < cols; k++) out[k] = ggml_h2f(p + 2 * k);
         return;
     case GGML_BF16:
         for (uint64_t k = 0; k < cols; k++) out[k] = bf16_to_f32((uint16_t)(p[2 * k] | p[2 * k + 1] << 8));
         return;
     }
-    const gtype_t *t = gtype(type);
-    for (uint64_t k = 0; k < cols / t->block; k++) deq_block(type, p + k * t->bytes, out + k * t->block);
+    const uint32_t per = ggml_block_values(type), bytes = ggml_block_bytes(type);
+    for (uint64_t u = 0; u < cols / 32; u++)
+        ggml_dequant_sub32(type, p + (u * 32 / per) * bytes, (int)(u % (per / 32)), out + u * 32);
 }
 
 bool path_is_gguf(const char *path) {
@@ -484,15 +322,15 @@ const gguf_tensor_t *gguf_tensor(const gguf_t *g, const char *name) {
 }
 
 const void *gguf_tensor_data(const gguf_t *g, const gguf_tensor_t *t) {
-    const gtype_t *ty = gtype(t->type);
-    if (!ty) {
+    const uint32_t per = ggml_block_values(t->type);
+    if (!per) {
         set_error("GGUF: tensor %s has type %d, which is not supported (supported: F32, F16, BF16, Q4_0, Q4_1, "
                   "Q5_0, Q5_1, Q8_0, Q2_K..Q6_K)", t->name, t->type);
         return NULL;
     }
-    if (t->ne[0] % ty->block) {
+    if (t->ne[0] % (per > 1 ? per : 1) || (per > 1 && t->ne[0] % 32)) {
         set_error("GGUF: tensor %s row length %llu is not a multiple of the %s block", t->name,
-                  (unsigned long long)t->ne[0], ty->name);
+                  (unsigned long long)t->ne[0], ggml_type_name(t->type));
         return NULL;
     }
     uint64_t rows = t->ne[1] * t->ne[2] * t->ne[3];
