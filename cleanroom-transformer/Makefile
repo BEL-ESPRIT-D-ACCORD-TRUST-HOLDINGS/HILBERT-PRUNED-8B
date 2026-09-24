@@ -17,7 +17,7 @@ OMP     ?= -fopenmp
 LDLIBS  += -lm
 
 HOST_SRC := src/base.c src/json.c src/sha256.c src/unicode.c src/tokenizer.c src/prompt.c \
-            src/safetensors.c src/model.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c
+            src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c
 BUILD := build
 
 .PHONY: all cuda cuda-check test formal clean

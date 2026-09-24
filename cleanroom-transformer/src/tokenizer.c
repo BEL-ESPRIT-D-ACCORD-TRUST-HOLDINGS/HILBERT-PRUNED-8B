@@ -124,6 +124,97 @@ static int merge_token_ids(tokenizer_t *t, const char *a, size_t na, const char 
     return 0;
 }
 
+/* ------------------------------------------------------- shared build steps */
+static void vocab_init(tokenizer_t *t, size_t n) {
+    t->vocab_cap = pow2_at_least(n * 2);
+    t->vocab = xcalloc(t->vocab_cap, sizeof *t->vocab);
+}
+
+static void vocab_add(tokenizer_t *t, const char *s, uint32_t n, uint32_t id) {
+    char *key = arena_strndup(&t->arena, s, n);
+    size_t h = fnv(key, n) & (t->vocab_cap - 1);
+    while (t->vocab[h].key) h = (h + 1) & (t->vocab_cap - 1);
+    t->vocab[h] = (vslot_t){key, n, id};
+    set_piece(t, id, key, n);
+}
+
+static void merges_init(tokenizer_t *t, size_t n) {
+    t->merges_cap = pow2_at_least(n * 2);
+    t->merges = xmalloc(t->merges_cap * sizeof *t->merges);
+    for (size_t k = 0; k < t->merges_cap; k++) t->merges[k].pair = UINT64_MAX;
+}
+
+static int merge_line(tokenizer_t *t, const char *s, size_t n, uint32_t rank) {
+    const char *sp = memchr(s, ' ', n);
+    if (!sp) return set_error("tokenizer: bad merge %u", rank);
+    size_t na = (size_t)(sp - s);
+    return merge_token_ids(t, s, na, sp + 1, n - na - 1, rank);
+}
+
+static int byte_tables(tokenizer_t *t) {
+    for (unsigned b = 0; b < 256; b++) {
+        char u[4];
+        int n = utf8_encode(byte_char(b), u);
+        const vslot_t *v = vocab_find(t, u, (size_t)n);
+        if (!v) return set_error("tokenizer: byte 0x%02X has no base token", b);
+        t->byte_id[b] = v->id;
+        memcpy(t->byte_str[b], u, (size_t)n);
+        t->byte_len[b] = (uint8_t)n;
+    }
+    return 0;
+}
+
+static void added_add(tokenizer_t *t, const char *s, uint32_t n, uint32_t id) {
+    char *copy = arena_strndup(&t->arena, s, n);
+    t->added[t->n_added++] = (added_t){copy, n, id};
+    set_piece(t, id, copy, n);
+}
+
+/* From GGUF metadata written by llama.cpp's converter (tokenizer.ggml.*). */
+int tokenizer_load_gguf(const gguf_t *g, tokenizer_t **out) {
+    const char *s;
+    size_t n;
+    if (!gguf_get_str(g, "tokenizer.ggml.model", &s, &n) || n != 4 || memcmp(s, "gpt2", 4))
+        return set_error("GGUF: only byte-level BPE tokenizers (tokenizer.ggml.model = gpt2) are supported");
+    if (!gguf_get_str(g, "tokenizer.ggml.pre", &s, &n) || n != 9 || memcmp(s, "llama-bpe", 9))
+        return set_error("GGUF: pre-tokenizer %.*s is not supported (llama-bpe)", (int)(s ? n : 0), s ? s : "");
+    gguf_array_t tokens, types, merges;
+    if (gguf_array(g, "tokenizer.ggml.tokens", &tokens) || gguf_array(g, "tokenizer.ggml.merges", &merges))
+        return -1;
+    bool have_types = gguf_array(g, "tokenizer.ggml.token_type", &types) == 0;
+    if (tokens.elem_type != 8 || merges.elem_type != 8 || (have_types && types.n != tokens.n))
+        return set_error("GGUF: malformed tokenizer arrays");
+    tokenizer_t *t = xcalloc(1, sizeof *t);
+    arena_init(&t->arena, 1 << 22);
+    t->pretok = PRETOK_LLAMA3;
+    t->nfc = false;
+    t->ignore_merges = true;
+    vocab_init(t, (size_t)tokens.n);
+    t->added = arena_alloc(&t->arena, (size_t)tokens.n * sizeof *t->added);
+    const unsigned char *pos = tokens.data;
+    int rc = 0;
+    for (uint64_t id = 0; id < tokens.n && !rc; id++) {
+        if (!gguf_array_next_str(&tokens, &pos, &s, &n)) {
+            rc = set_error("GGUF: truncated token list");
+            break;
+        }
+        int64_t type = have_types ? gguf_array_int(&types, id) : 1;
+        /* control (3) and user-defined (4) tokens are matched before pre-tokenization, like HF added tokens */
+        if (type == 3 || type == 4) added_add(t, s, (uint32_t)n, (uint32_t)id);
+        else vocab_add(t, s, (uint32_t)n, (uint32_t)id);
+    }
+    if (!rc) merges_init(t, (size_t)merges.n);
+    pos = merges.data;
+    for (uint64_t r = 0; r < merges.n && !rc; r++) {
+        if (!gguf_array_next_str(&merges, &pos, &s, &n)) rc = set_error("GGUF: truncated merge list");
+        else rc = merge_line(t, s, n, (uint32_t)r);
+    }
+    if (!rc) rc = byte_tables(t);
+    if (rc) tokenizer_free(t);
+    else *out = t;
+    return rc;
+}
+
 int tokenizer_load(const char *path, tokenizer_t **out) {
     char *text;
     size_t len;
@@ -174,35 +265,20 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
         set_error("tokenizer: missing model.vocab or model.merges");
         goto done;
     }
-    t->vocab_cap = pow2_at_least((size_t)vocab->n * 2);
-    t->vocab = xcalloc(t->vocab_cap, sizeof *t->vocab);
+    vocab_init(t, (size_t)vocab->n);
     for (uint32_t k = 0; k < vocab->n; k++) {
         const jval *idv = vocab->u.obj.vals[k];
         if (idv->type != J_INT || idv->u.str[0] == '-') {
             set_error("tokenizer: bad vocab id");
             goto done;
         }
-        uint32_t id = (uint32_t)strtoul(idv->u.str, NULL, 10);
-        uint32_t klen = vocab->u.obj.key_lens[k];
-        char *key = arena_strndup(&t->arena, vocab->u.obj.keys[k], klen);
-        size_t h = fnv(key, klen) & (t->vocab_cap - 1);
-        while (t->vocab[h].key) h = (h + 1) & (t->vocab_cap - 1);
-        t->vocab[h] = (vslot_t){key, klen, id};
-        set_piece(t, id, key, klen);
+        vocab_add(t, vocab->u.obj.keys[k], vocab->u.obj.key_lens[k], (uint32_t)strtoul(idv->u.str, NULL, 10));
     }
-    t->merges_cap = pow2_at_least((size_t)merges->n * 2);
-    t->merges = xmalloc(t->merges_cap * sizeof *t->merges);
-    for (size_t k = 0; k < t->merges_cap; k++) t->merges[k].pair = UINT64_MAX;
+    merges_init(t, (size_t)merges->n);
     for (uint32_t r = 0; r < merges->n; r++) {
         const jval *m = merges->u.items[r];
         if (m->type == J_STRING) {
-            const char *sp = memchr(m->u.str, ' ', m->n);
-            if (!sp) {
-                set_error("tokenizer: bad merge %u", r);
-                goto done;
-            }
-            size_t na = (size_t)(sp - m->u.str);
-            if (merge_token_ids(t, m->u.str, na, sp + 1, m->n - na - 1, r)) goto done;
+            if (merge_line(t, m->u.str, m->n, r)) goto done;
         } else if (m->type == J_ARRAY && m->n == 2 && json_is_str(m->u.items[0]) &&
                    json_is_str(m->u.items[1])) {
             if (merge_token_ids(t, m->u.items[0]->u.str, m->u.items[0]->n, m->u.items[1]->u.str,
@@ -213,18 +289,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
             goto done;
         }
     }
-    for (unsigned b = 0; b < 256; b++) {
-        char u[4];
-        int n = utf8_encode(byte_char(b), u);
-        const vslot_t *v = vocab_find(t, u, (size_t)n);
-        if (!v) {
-            set_error("tokenizer: byte 0x%02X has no base token", b);
-            goto done;
-        }
-        t->byte_id[b] = v->id;
-        memcpy(t->byte_str[b], u, (size_t)n);
-        t->byte_len[b] = (uint8_t)n;
-    }
+    if (byte_tables(t)) goto done;
     const jval *added = json_get(root, "added_tokens");
     if (added && added->type == J_ARRAY) {
         t->added = arena_alloc(&t->arena, added->n * sizeof *t->added);
@@ -240,10 +305,7 @@ int tokenizer_load(const char *path, tokenizer_t **out) {
                 set_error("tokenizer: normalized added tokens are not supported");
                 goto done;
             }
-            char *s = arena_strndup(&t->arena, content->u.str, content->n);
-            uint32_t tid = (uint32_t)strtoul(id->u.str, NULL, 10);
-            t->added[t->n_added++] = (added_t){s, content->n, tid};
-            set_piece(t, tid, s, content->n);
+            added_add(t, content->u.str, content->n, (uint32_t)strtoul(id->u.str, NULL, 10));
         }
     }
     rc = 0;

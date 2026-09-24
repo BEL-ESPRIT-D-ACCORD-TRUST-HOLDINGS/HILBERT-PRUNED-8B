@@ -20,13 +20,16 @@ static void usage(void) {
             "  tokenize  token ids of stdin, or of each JSON string line in --input\n"
             "  logits    raw logits               --tokens \"1 2 3\" --ids \"4 5\" [--split N]\n"
             "  selftest  check CUDA kernels against the CPU reference  [--tokens N]\n"
-            "  shapes    print every matrix multiply and activation width as JSON (config.json only)\n"
+            "  shapes    print every matrix multiply and activation width as JSON (config only)\n"
+            "  dequant   print a GGUF tensor as float32 rows            --tensor NAME\n"
+            "\n"
+            "--model is a Hugging Face folder or a .gguf file.\n"
             "\n"
             "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n");
 }
 
 typedef struct {
-    const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids;
+    const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor;
     int device, port;
     size_t max_tokens, max_body, split, n_selftest;
 } args_t;
@@ -60,6 +63,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--tokens") && !strcmp(a->cmd, "selftest")) a->n_selftest = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--tokens")) a->tokens = v;
         else if (!strcmp(k, "--ids")) a->ids = v;
+        else if (!strcmp(k, "--tensor")) a->tensor = v;
         else if (!strcmp(k, "--device")) a->device = atoi(v);
         else if (!strcmp(k, "--port")) a->port = atoi(v);
         else if (!strcmp(k, "--max-tokens")) a->max_tokens = strtoull(v, NULL, 10);
@@ -72,6 +76,13 @@ static int parse_args(int argc, char **argv, args_t *a) {
 }
 
 static int load_tokenizer(const char *dir, tokenizer_t **t) {
+    if (path_is_gguf(dir)) {
+        gguf_t *g;
+        if (gguf_open(dir, &g)) return -1;
+        int rc = tokenizer_load_gguf(g, t);
+        gguf_close(g);
+        return rc;
+    }
     char path[4096];
     snprintf(path, sizeof path, "%s/tokenizer.json", dir);
     return tokenizer_load(path, t);
@@ -343,6 +354,35 @@ static int cmd_shapes(const args_t *a) {
     return 0;
 }
 
+static int cmd_dequant(const args_t *a) {
+    if (!a->tensor) return set_error("--tensor is required");
+    gguf_t *g;
+    if (gguf_open(a->model, &g)) return -1;
+    const gguf_tensor_t *t = gguf_tensor(g, a->tensor);
+    const void *data = t ? gguf_tensor_data(g, t) : NULL;
+    if (!t) set_error("GGUF: no tensor %s", a->tensor);
+    int rc = data ? 0 : -1;
+    if (!rc) {
+        uint64_t rows = t->ne[1] * t->ne[2] * t->ne[3], cols = t->ne[0];
+        size_t rb = ggml_row_bytes(t->type, cols);
+        float *row = xmalloc(cols * sizeof(float));
+        sbuf_t b = {0};
+        for (uint64_t r = 0; r < rows; r++) {
+            ggml_dequantize_row(t->type, (const char *)data + r * rb, row, cols);
+            b.len = 0;
+            for (uint64_t k = 0; k < cols; k++) {
+                if (k) sb_putc(&b, ' ');
+                json_dump_double(&b, (double)row[k]);
+            }
+            puts(b.data);
+        }
+        sb_free(&b);
+        free(row);
+    }
+    gguf_close(g);
+    return rc;
+}
+
 static int cmd_selftest(const args_t *a) {
 #ifdef USE_CUDA
     model_t m;
@@ -370,6 +410,7 @@ int main(int argc, char **argv) {
     else if (!strcmp(a.cmd, "logits")) rc = cmd_logits(&a);
     else if (!strcmp(a.cmd, "selftest")) rc = cmd_selftest(&a);
     else if (!strcmp(a.cmd, "shapes")) rc = cmd_shapes(&a);
+    else if (!strcmp(a.cmd, "dequant")) rc = cmd_dequant(&a);
     else {
         usage();
         return 2;

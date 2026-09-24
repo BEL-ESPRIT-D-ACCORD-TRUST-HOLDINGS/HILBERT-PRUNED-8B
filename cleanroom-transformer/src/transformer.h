@@ -142,7 +142,7 @@ int decision_encode(const tokenizer_t *t, const chat_format_t *fmt, const decisi
 void encoded_free(encoded_t *e);
 
 /* ------------------------------------------------------------- safetensors */
-typedef enum { DT_F32, DT_F16, DT_BF16 } dtype_t;
+typedef enum { DT_F32, DT_F16, DT_BF16, DT_GGML } dtype_t;
 
 typedef struct {
     char *name;
@@ -166,6 +166,45 @@ int st_open_dir(const char *dir, st_set_t *out);
 const st_tensor_t *st_find(const st_set_t *s, const char *name);
 void st_close(st_set_t *s);
 
+/* -------------------------------------------------------------------- gguf */
+enum {
+    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7, GGML_Q8_0 = 8,
+    GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30
+};
+
+typedef struct gguf gguf_t;
+typedef struct {
+    char name[256];
+    uint32_t n_dims;
+    uint64_t ne[4]; /* ne[0] is the contiguous (row) dimension */
+    int type;
+    uint64_t offset;
+} gguf_tensor_t;
+typedef struct {
+    uint32_t elem_type;
+    uint64_t n;
+    const unsigned char *data, *end;
+} gguf_array_t;
+
+bool path_is_gguf(const char *path);
+int gguf_open(const char *path, gguf_t **out);
+void gguf_close(gguf_t *g);
+bool gguf_has(const gguf_t *g, const char *key);
+bool gguf_get_u64(const gguf_t *g, const char *key, uint64_t *out);
+bool gguf_get_f64(const gguf_t *g, const char *key, double *out);
+bool gguf_get_str(const gguf_t *g, const char *key, const char **s, size_t *n);
+int gguf_array(const gguf_t *g, const char *key, gguf_array_t *out);
+bool gguf_array_next_str(const gguf_array_t *a, const unsigned char **pos, const char **s, size_t *n);
+int64_t gguf_array_int(const gguf_array_t *a, uint64_t i);
+const gguf_tensor_t *gguf_tensor(const gguf_t *g, const char *name);
+const void *gguf_tensor_data(const gguf_t *g, const gguf_tensor_t *t); /* checks bounds and type */
+const char *ggml_type_name(int type);
+size_t ggml_row_bytes(int type, uint64_t cols);
+void ggml_dequantize_row(int type, const void *src, float *out, uint64_t cols);
+
+int tokenizer_load_gguf(const gguf_t *g, tokenizer_t **out);
+int chat_format_from_gguf(const gguf_t *g, chat_format_t *out);
+
 /* ------------------------------------------------------------------- model */
 enum { LAYER_LINEAR = 0, LAYER_FULL = 1 };
 enum { ARCH_QWEN35 = 0, ARCH_LLAMA = 1 };
@@ -185,12 +224,17 @@ typedef struct {
     uint32_t n_full, n_linear;
 } config_t;
 
-/* A weight matrix [rows, cols] kept in its source dtype. */
+/* A weight matrix [rows, cols] kept in its source dtype (possibly GGUF-quantized). */
 typedef struct {
     dtype_t dtype;
     uint32_t rows, cols;
     const void *data;
+    int ggml_type;       /* DT_GGML: block format */
+    uint32_t perm_heads; /* >0: rows are llama.cpp-interleaved RoPE pairs in this many heads (see wmat_row) */
 } wmat_t;
+
+/* Row r of W as float32, in Hugging Face order. */
+void wmat_row_f32(const wmat_t *w, uint32_t r, float *out);
 
 typedef struct {
     uint32_t type, slot; /* slot indexes the full or linear state arrays */
@@ -212,6 +256,7 @@ typedef struct {
     float *final_norm;
     layer_t *layers;
     float *rope_inv_freq; /* [rot_dim/2] */
+    gguf_t *gguf;         /* set when loaded from a .gguf file */
     char source[512];
 } model_t;
 
