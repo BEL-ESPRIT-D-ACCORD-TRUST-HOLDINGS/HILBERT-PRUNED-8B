@@ -280,14 +280,16 @@ static int bind_vec(binder_t *b, float **v, uint64_t count, const char *fmt, int
     return 0;
 }
 
+uint32_t wmat_src_row(const wmat_t *w, uint32_t r) {
+    if (!w->perm_heads) return r;
+    /* llama.cpp stores each head's rotary pairs interleaved: row 2i+j of a head holds
+     * Hugging Face row j*(hd/2)+i. Undo that so the half-split RoPE applies. */
+    uint32_t hd = w->rows / w->perm_heads, half = hd / 2, within = r % hd;
+    return r - within + 2 * (within % half) + within / half;
+}
+
 void wmat_row_f32(const wmat_t *w, uint32_t r, float *out) {
-    uint32_t src = r;
-    if (w->perm_heads) {
-        /* llama.cpp stores each head's rotary pairs interleaved: row 2i+j of a head holds
-         * Hugging Face row j*(hd/2)+i. Undo that so the half-split RoPE applies. */
-        uint32_t hd = w->rows / w->perm_heads, half = hd / 2, within = r % hd;
-        src = r - within + 2 * (within % half) + within / half;
-    }
+    uint32_t src = wmat_src_row(w, r);
     size_t off = (size_t)src * w->cols;
     switch (w->dtype) {
     case DT_F32: memcpy(out, (const float *)w->data + off, w->cols * sizeof(float)); break;

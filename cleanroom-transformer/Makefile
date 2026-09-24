@@ -23,7 +23,7 @@ BUILD := build
 .PHONY: all cuda cuda-check test formal clean
 all: $(BUILD)/cleanroom-transformer
 
-$(BUILD)/cpu/%.o: src/%.c src/transformer.h src/ops_common.h src/unicode_tables.h
+$(BUILD)/cpu/%.o: src/%.c src/transformer.h src/ops_common.h src/ggml_quant.h src/unicode_tables.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(OMP) -c $< -o $@
 
@@ -31,11 +31,11 @@ $(BUILD)/cleanroom-transformer: $(patsubst src/%.c,$(BUILD)/cpu/%.o,$(HOST_SRC) 
 	$(CC) $(CFLAGS) $(OMP) $^ -o $@ $(LDLIBS)
 
 # ------------------------------------------------------------------ CUDA
-$(BUILD)/gpu/%.o: src/%.c src/transformer.h src/ops_common.h src/unicode_tables.h
+$(BUILD)/gpu/%.o: src/%.c src/transformer.h src/ops_common.h src/ggml_quant.h src/unicode_tables.h
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(OMP) -DUSE_CUDA -c $< -o $@
 
-$(BUILD)/gpu/cuda_backend.o: src/cuda_backend.cu src/transformer.h src/ops_common.h
+$(BUILD)/gpu/cuda_backend.o: src/cuda_backend.cu src/transformer.h src/ops_common.h src/ggml_quant.h
 	@mkdir -p $(dir $@)
 	$(NVCC) -std=c++17 -O3 $(CUDA_ARCH) -Isrc -DUSE_CUDA -Xcompiler -Wall -c $< -o $@
 

@@ -25,12 +25,14 @@ static void usage(void) {
             "\n"
             "--model is a Hugging Face folder or a .gguf file.\n"
             "\n"
-            "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n");
+            "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n"
+            "                [--gpu-weights quantized|bf16]   GGUF weights on the GPU (default: quantized)\n");
 }
 
 typedef struct {
     const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor;
     int device, port;
+    bool gpu_bf16;
     size_t max_tokens, max_body, split, n_selftest;
 } args_t;
 
@@ -69,6 +71,10 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--max-tokens")) a->max_tokens = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--max-body")) a->max_body = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--split")) a->split = strtoull(v, NULL, 10);
+        else if (!strcmp(k, "--gpu-weights")) {
+            if (strcmp(v, "quantized") && strcmp(v, "bf16")) return -1;
+            a->gpu_bf16 = !strcmp(v, "bf16");
+        }
         else return -1;
     }
     if (!a->model || a->max_tokens < 1) return -1;
@@ -91,7 +97,7 @@ static int load_tokenizer(const char *dir, tokenizer_t **t) {
 static backend_t *make_backend(const args_t *a, const model_t *m) {
     if (!strcmp(a->backend, "cpu")) return cpu_backend_create(m, a->max_tokens);
 #ifdef USE_CUDA
-    if (!strcmp(a->backend, "cuda")) return cuda_backend_create(m, a->max_tokens, a->device);
+    if (!strcmp(a->backend, "cuda")) return cuda_backend_create(m, a->max_tokens, a->device, !a->gpu_bf16);
 #endif
     set_error("backend %s is not available in this build", a->backend);
     return NULL;

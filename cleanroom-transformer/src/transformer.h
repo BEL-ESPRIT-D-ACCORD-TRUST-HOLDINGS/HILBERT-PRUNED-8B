@@ -167,10 +167,7 @@ const st_tensor_t *st_find(const st_set_t *s, const char *name);
 void st_close(st_set_t *s);
 
 /* -------------------------------------------------------------------- gguf */
-enum {
-    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7, GGML_Q8_0 = 8,
-    GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30
-};
+/* GGML_* type ids and block sizes live in ggml_quant.h (shared with the CUDA kernels). */
 
 typedef struct gguf gguf_t;
 typedef struct {
@@ -235,6 +232,8 @@ typedef struct {
 
 /* Row r of W as float32, in Hugging Face order. */
 void wmat_row_f32(const wmat_t *w, uint32_t r, float *out);
+/* Storage row holding Hugging Face row r (differs only for llama.cpp's interleaved q/k rows). */
+uint32_t wmat_src_row(const wmat_t *w, uint32_t r);
 
 typedef struct {
     uint32_t type, slot; /* slot indexes the full or linear state arrays */
@@ -294,7 +293,9 @@ struct backend {
 
 backend_t *cpu_backend_create(const model_t *m, size_t max_seq);
 #ifdef USE_CUDA
-backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device);
+/* keep_quantized: GGUF quantized weights stay in their block format on the GPU
+ * (dequantized inside the kernels); otherwise every weight is uploaded as bf16. */
+backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device, bool keep_quantized);
 int cuda_selftest(const model_t *m, int device, size_t n_tokens, int verbose);
 #endif
 
