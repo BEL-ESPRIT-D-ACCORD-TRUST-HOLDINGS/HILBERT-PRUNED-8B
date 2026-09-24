@@ -237,7 +237,43 @@ __device__ __forceinline__ void mainloop(const Segment &s0, const Segment &s1, c
     __syncthreads();  // every stage is free before the next range's prologue refills it
 }
 
-// Fused epilogue. Accumulator c[0..1] = (row lane/4, cols 2*(lane%4)+{0,1}), c[2..3] = row + 8.
+// One output pair (r, c), (r, c + 1) from its finished sums: the fused epilogue shared by every kernel.
+// Returns this pair's |s_new - s_old| (relax), 0 for the update.
+__device__ __forceinline__ float epi_pair(const Epilogue &ep, int r, int c, float v0, float v1) {
+    const size_t o = (size_t)r * ep.ldc + c;
+    if (ep.kind == 0) {  // kernel-uniform branch
+        const float2 old = __bfloat1622float2(*(const __nv_bfloat162 *)(ep.s_old + o));
+        float x0 = v0 + ep.bias[c], x1 = v1 + ep.bias[c + 1];
+        if (ep.target) {
+            const float2 y = __bfloat1622float2(*(const __nv_bfloat162 *)(ep.target + o));
+            x0 = fmaf(ep.beta, y.x - old.x, x0);
+            x1 = fmaf(ep.beta, y.y - old.y, x1);
+        }
+        x0 = fminf(fmaxf(x0, 0.f), 1.f);
+        x1 = fminf(fmaxf(x1, 0.f), 1.f);
+        const __nv_bfloat162 q = __floats2bfloat162_rn(x0, x1);
+        *(__nv_bfloat162 *)(ep.s_new + o) = q;
+        const float2 qf = __bfloat1622float2(q);
+        return fabsf(qf.x - old.x) + fabsf(qf.y - old.y);
+    }
+    float2 w = *(float2 *)(ep.w32 + o);
+    w.x = fmaf(ep.scale, v0, w.x);
+    w.y = fmaf(ep.scale, v1, w.y);
+    *(float2 *)(ep.w32 + o) = w;
+    *(__nv_bfloat162 *)(ep.w16 + o) = __floats2bfloat162_rn(w.x, w.y);
+    return 0.f;
+}
+
+// Warp tree reduction in registers, one atomic per warp. Whole warps only.
+__device__ __forceinline__ void add_delta(const Epilogue &ep, float dsum, int lane) {
+    if (ep.kind != 0) return;
+#pragma unroll
+    for (int d = 16; d > 0; d >>= 1) dsum += __shfl_down_sync(0xffffffffu, dsum, d);
+    if (lane == 0) atomicAdd(ep.delta, dsum);
+}
+
+// Fused epilogue of a finished tile. Accumulator c[0..1] = (row lane/4, cols 2*(lane%4)+{0,1}),
+// c[2..3] = row + 8.
 __device__ __forceinline__ void epilogue(const Epilogue &ep, const Ctx &x, int m0, int n0,
                                          const float (&acc)[MT][NT][4]) {
     float dsum = 0.f;
@@ -246,38 +282,10 @@ __device__ __forceinline__ void epilogue(const Epilogue &ep, const Ctx &x, int m
 #pragma unroll
         for (int j = 0; j < NT; j++)
 #pragma unroll
-            for (int h = 0; h < 2; h++) {
-                const int r = m0 + x.wm0 + i * 16 + (x.lane >> 2) + h * 8;
-                const int c = n0 + x.wn0 + j * 8 + (x.lane & 3) * 2;
-                const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
-                const size_t o = (size_t)r * ep.ldc + c;
-                if (ep.kind == 0) {  // kernel-uniform branch
-                    const float2 old = __bfloat1622float2(*(const __nv_bfloat162 *)(ep.s_old + o));
-                    float x0 = v0 + ep.bias[c], x1 = v1 + ep.bias[c + 1];
-                    if (ep.target) {
-                        const float2 y = __bfloat1622float2(*(const __nv_bfloat162 *)(ep.target + o));
-                        x0 = fmaf(ep.beta, y.x - old.x, x0);
-                        x1 = fmaf(ep.beta, y.y - old.y, x1);
-                    }
-                    x0 = fminf(fmaxf(x0, 0.f), 1.f);
-                    x1 = fminf(fmaxf(x1, 0.f), 1.f);
-                    const __nv_bfloat162 q = __floats2bfloat162_rn(x0, x1);
-                    *(__nv_bfloat162 *)(ep.s_new + o) = q;
-                    const float2 qf = __bfloat1622float2(q);
-                    dsum += fabsf(qf.x - old.x) + fabsf(qf.y - old.y);
-                } else {
-                    float2 w = *(float2 *)(ep.w32 + o);
-                    w.x = fmaf(ep.scale, v0, w.x);
-                    w.y = fmaf(ep.scale, v1, w.y);
-                    *(float2 *)(ep.w32 + o) = w;
-                    *(__nv_bfloat162 *)(ep.w16 + o) = __floats2bfloat162_rn(w.x, w.y);
-                }
-            }
-    if (ep.kind == 0) {  // warp tree reduction in registers, one atomic per warp
-#pragma unroll
-        for (int d = 16; d > 0; d >>= 1) dsum += __shfl_down_sync(0xffffffffu, dsum, d);
-        if (x.lane == 0) atomicAdd(ep.delta, dsum);
-    }
+            for (int h = 0; h < 2; h++)
+                dsum += epi_pair(ep, m0 + x.wm0 + i * 16 + (x.lane >> 2) + h * 8,
+                                 n0 + x.wn0 + j * 8 + (x.lane & 3) * 2, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
+    add_delta(ep, dsum, x.lane);
 }
 
 __device__ __forceinline__ Ctx setup(unsigned char *smem, uint64_t *full) {
@@ -397,6 +405,73 @@ ep_gemm_streamk_kernel(Segment s0, Segment s1, int nseg, Epilogue ep, int tiles_
 }
 
 // ======================================================================================================
+// Split-K, two kernels: ep_gemm_splitk_kernel + ep_splitk_reduce_kernel
+// ------------------------------------------------------------------------------------------------------
+//  ep_gemm_splitk_kernel
+//   Work           : grid (N/128, M/128, S). Block z computes k-tiles [z T / S, (z+1) T / S) of its output
+//                    tile (default S = 2: every tile's K-loop runs on two SMs at once) and stores the raw
+//                    f32 sums to slice z of a [S][M][N] workspace (float2 per accumulator pair, st.cg).
+//   Registers/smem : same mainloop as ep_gemm_kernel (ptxas report from `make ep`); no epilogue.
+//   Occupancy      : as ep_gemm_kernel, 2 blocks / SM; S x as many blocks as data-parallel.
+//   Bound          : mainloop as ep_gemm_kernel, plus S x M x N x 4 B of partial writes.
+//  ep_splitk_reduce_kernel
+//   Work           : one thread per output pair, grid-stride: sums the S slices (ld.cg, float2), then the
+//                    same fused epilogue (bias, nudge, clamp, bf16 store, |ds|; or the weight update).
+//   Registers      : small (see ptxas); __launch_bounds__(256, 6) -> <= 40 registers, 6 x 256 = 1536
+//                    threads / SM = 48 warps = 100% occupancy, which suits a purely streaming kernel.
+//   Shared         : none.
+//   Bound          : memory-bound: reads S x 8 B + epilogue operands, writes 4..12 B per pair, ~0 FLOP/B.
+//  Versus Stream-K : no inter-block synchronisation or residency requirement, and two plain launches; costs
+//                    the full-size workspace round trip and a second launch.
+// ======================================================================================================
+__global__ void __launch_bounds__(THREADS, 2)
+ep_gemm_splitk_kernel(Segment s0, Segment s1, int nseg, int M, int N, float *__restrict__ ws) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    __shared__ __align__(8) uint64_t full[STAGES];
+    const Ctx x = setup(smem, full);
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN, S = gridDim.z, z = blockIdx.z;
+    const int T = s0.ktiles + (nseg > 1 ? s1.ktiles : 0);
+    float acc[MT][NT][4];
+    zero(acc);
+    uint32_t seq = 0;
+    mainloop(s0, s1, x, m0, n0, z * T / S, (z + 1) * T / S, seq, acc);
+    float *slice = ws + (size_t)z * M * N;
+#pragma unroll
+    for (int i = 0; i < MT; i++)
+#pragma unroll
+        for (int j = 0; j < NT; j++)
+#pragma unroll
+            for (int h = 0; h < 2; h++) {
+                const int r = m0 + x.wm0 + i * 16 + (x.lane >> 2) + h * 8;
+                const int c = n0 + x.wn0 + j * 8 + (x.lane & 3) * 2;
+                __stcg((float2 *)(slice + (size_t)r * N + c), make_float2(acc[i][j][2 * h], acc[i][j][2 * h + 1]));
+            }
+}
+
+__global__ void __launch_bounds__(THREADS, 6)
+ep_splitk_reduce_kernel(Epilogue ep, int M, int N, int S, const float *__restrict__ ws) {
+    const int pairs = M * (N / 2), lane = threadIdx.x & 31;
+    const size_t slice = (size_t)M * N;
+    float dsum = 0.f;
+    // grid-stride with a warp-uniform trip count, so the final shuffle reduction always has whole warps
+    const int stride = gridDim.x * blockDim.x;
+    const int first = blockIdx.x * blockDim.x + (threadIdx.x & ~31);
+    for (int base = first; base < pairs; base += stride) {
+        const int idx = base + lane;
+        if (idx < pairs) {  // only the last partial warp is predicated
+            const int r = idx / (N / 2), c = (idx - r * (N / 2)) * 2;
+            float2 v = __ldcg((const float2 *)(ws + (size_t)r * N + c));
+            for (int z = 1; z < S; z++) {
+                const float2 u = __ldcg((const float2 *)(ws + z * slice + (size_t)r * N + c));
+                v.x += u.x, v.y += u.y;
+            }
+            dsum += epi_pair(ep, r, c, v.x, v.y);
+        }
+    }
+    add_delta(ep, dsum, lane);
+}
+
+// ======================================================================================================
 // Host API
 // ======================================================================================================
 #define CK(x)                                                                                          \
@@ -416,16 +491,20 @@ static int check_shape(int M, int N, int K, const char *what) {
     return 0;
 }
 
-// 0 = choose by shape, 1 = always data-parallel, 2 = always Stream-K (tests and benchmarks)
-static int g_mode = 0;
+// 0 = choose by shape (data-parallel or Stream-K), 1 = data-parallel, 2 = Stream-K, 3 = split-K (two kernels).
+// The Stream-K and split-K workspaces are shared: issue calls from one stream at a time.
+static int g_mode = 0, g_splits = 2;
+static float *g_splitk_ws = NULL;
+static size_t g_splitk_bytes = 0;
 static int g_resident = 0;  // blocks of 256 resident at once on the whole GPU
 static float *g_partials = NULL;
 static int *g_flags = NULL, g_epoch = 0;
 
 static int launch_ready(void) {
     if (g_resident) return 0;
-    const void *fns[] = {(const void *)ep_gemm_kernel, (const void *)ep_gemm_streamk_kernel};
-    for (int f = 0; f < 2; f++) {
+    const void *fns[] = {(const void *)ep_gemm_kernel, (const void *)ep_gemm_streamk_kernel,
+                         (const void *)ep_gemm_splitk_kernel};
+    for (int f = 0; f < 3; f++) {
         CK(cudaFuncSetAttribute(fns[f], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
         // 2 x (48 KB + 128 B + 1 KB reserved) needs the full 100 KB shared carveout for 2 blocks/SM
         CK(cudaFuncSetAttribute(fns[f], cudaFuncAttributePreferredSharedMemoryCarveout,
@@ -453,7 +532,24 @@ static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &
     // Data-parallel when the last wave is at least 3/4 full or there are many waves; Stream-K otherwise.
     const int waves = (tiles + g_resident - 1) / g_resident, tail = tiles - (waves - 1) * g_resident;
     const bool streamk = g_mode == 2 || (g_mode == 0 && waves < 4 && 4 * tail < 3 * g_resident);
-    if (!streamk) {
+    if (g_mode == 3) {
+        const int S = g_splits < kiters ? g_splits : kiters;
+        const size_t need = (size_t)S * M * N * sizeof(float);
+        if (need > g_splitk_bytes) {
+            cudaFree(g_splitk_ws);
+            g_splitk_ws = NULL, g_splitk_bytes = 0;
+            CK(cudaMalloc(&g_splitk_ws, need));
+            g_splitk_bytes = need;
+        }
+        ep_gemm_splitk_kernel<<<dim3(tiles_n, M / BM, S), THREADS, SMEM_BYTES, st>>>(a, b, nseg, M, N, g_splitk_ws);
+        CK(cudaGetLastError());
+        const int pairs = M * (N / 2);
+        // at most 4 full waves of the reduce kernel (6 blocks/SM x #SMs each); grid-stride covers the rest
+        const int sms = g_resident / 2, cap = 4 * 6 * sms;
+        int blocks = (pairs + THREADS - 1) / THREADS;
+        if (blocks > cap) blocks = cap;
+        ep_splitk_reduce_kernel<<<blocks, THREADS, 0, st>>>(ep, M, N, S, g_splitk_ws);
+    } else if (!streamk) {
         ep_gemm_kernel<<<dim3(tiles_n, M / BM), THREADS, SMEM_BYTES, st>>>(a, b, nseg, ep);
     } else {
         const long long work = (long long)tiles * kiters;
@@ -467,6 +563,15 @@ static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &
                                                                g_flags, g_epoch);
     }
     CK(cudaGetLastError());
+    return 0;
+}
+
+// Work decomposition for later calls: 0 = automatic (data-parallel or Stream-K by shape), 1 = data-parallel,
+// 2 = Stream-K, 3 = split-K over `splits` blocks per tile (two kernels; splits >= 2, default 2).
+extern "C" int ep_set_decomposition(int mode, int splits) {
+    if (mode < 0 || mode > 3 || (mode == 3 && splits < 2)) return -1;
+    g_mode = mode;
+    if (mode == 3) g_splits = splits;
     return 0;
 }
 
@@ -716,9 +821,9 @@ static int bench(void) {
         CK(cudaMemset(bias, 0, N * 4));
         CK(cudaMalloc(&delta, 4));
         CK(cudaMalloc(&out, (size_t)M * N * 2));
-        double t[3] = {0, 0, 0};
-        for (int mode = 1; mode <= 2; mode++) {
-            g_mode = mode;
+        double t[4] = {0, 0, 0, 0};
+        for (int mode = 1; mode <= 3; mode++) {
+            ep_set_decomposition(mode, 2);
             if (ep_relax(A.d, K, B.d, NULL, 0, NULL, bias, old.d, NULL, 0, out, M, N, delta, 0)) return -1;  // warm-up
             CK(cudaEventRecord(e0));
             for (int r = 0; r < reps; r++)
@@ -729,12 +834,13 @@ static int bench(void) {
             CK(cudaEventElapsedTime(&ms, e0, e1));
             t[mode] = ms / reps;
         }
-        g_mode = 0;
+        ep_set_decomposition(0, 2);
         const double flop = 2.0 * M * N * K;
         const int tiles = (M / BM) * (N / BN);
-        printf("    %5d x %5d x %5d  %4d tiles  data-parallel %8.4f ms %5.1f TFLOPS | Stream-K %8.4f ms %5.1f TFLOPS"
-               "  (%.2fx)\n",
-               M, N, K, tiles, t[1], flop / t[1] / 1e9, t[2], flop / t[2] / 1e9, t[1] / t[2]);
+        printf("    %5d x %5d x %5d %4d tiles | data-parallel %8.4f ms %5.1f TF | Stream-K %8.4f ms %5.1f TF (%.2fx)"
+               " | split-K x2 %8.4f ms %5.1f TF (%.2fx)\n",
+               M, N, K, tiles, t[1], flop / t[1] / 1e9, t[2], flop / t[2] / 1e9, t[1] / t[2], t[3], flop / t[3] / 1e9,
+               t[1] / t[3]);
         cudaFree(A.d), cudaFree(B.d), cudaFree(old.d), cudaFree(bias), cudaFree(delta), cudaFree(out);
         free(A.h), free(B.h), free(old.h);
     }
@@ -752,16 +858,16 @@ int main(int argc, char **argv) {
         return 2;
     }
     printf("%s, sm_%d%d, %d SMs\n", p.name, p.major, p.minor, p.multiProcessorCount);
-    static const char *names[] = {"", "data-parallel", "Stream-K"};
-    for (int mode = 1; mode <= 2; mode++) {  // every path, both decompositions
-        g_mode = mode;
-        printf("%s kernel vs host reference (same bf16 operands):\n", names[mode]);
+    static const char *names[] = {"", "data-parallel", "Stream-K", "split-K x2 (two kernels)", "split-K x3 (two kernels)"};
+    for (int v = 1; v <= 4; v++) {  // every path, every decomposition
+        ep_set_decomposition(v < 4 ? v : 3, v == 4 ? 3 : 2);
+        printf("%s vs host reference (same bf16 operands):\n", names[v]);
         if (test_relax(128, 128, 32, 0, false) || test_relax(256, 384, 512, 0, false) ||
             test_relax(256, 256, 256, 128, false) || test_relax(128, 128, 256, 0, true) ||
             test_relax(512, 256, 4096, 0, false) || test_update(128, 256, 128) || test_update(384, 256, 512))
             return 1;
     }
-    g_mode = 0;
+    ep_set_decomposition(0, 2);
     printf("automatic choice:\n");
     if (demo_step() || bench()) return 1;
     if (failures) {

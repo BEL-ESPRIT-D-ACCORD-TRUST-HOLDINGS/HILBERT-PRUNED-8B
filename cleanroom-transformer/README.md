@@ -298,25 +298,39 @@ How it is built:
 - a 3-stage `cp.async.cg` pipeline tracked by `mbarrier`;
 - warp-shuffle reductions.
 
-Each matrix multiply runs one of two ways. The host picks automatically:
+Each matrix multiply runs one of three ways. The host picks between the
+first two automatically; `ep_set_decomposition(mode, splits)` forces any of
+them:
 
 - **Data-parallel:** one 128×128 output tile per block.
 - **Stream-K:** for shapes that leave a wave of blocks underfilled, as small
   EP batches do. The K-loop work of all tiles is split evenly over every
   resident block. A block that starts inside a tile hands its partial sum to
   the tile's owner through a 64 KB workspace slot and an epoch flag.
+- **Split-K (two kernels, opt-in):** each tile's K-loop is split over
+  `splits` blocks (default 2, so two SMs per tile).
+  - The first kernel writes raw partial sums to a `[splits][M][N]`
+    workspace.
+  - The second kernel adds them and applies the same fused epilogue. It is
+    memory-bound and elementwise, uses 40 registers, and runs at 100%
+    occupancy.
+  - It needs no inter-block synchronization, at the cost of the workspace
+    round trip and a second launch.
 
-Both kernels use 128 registers with no spills and no stack (ptxas), which
-allows 2 blocks of 256 threads per SM. Stream-K needs every block resident
+The data-parallel and Stream-K kernels use 128 registers and the split-K
+kernel 105, all with no spills and no stack (ptxas). That allows 2 blocks of
+256 threads per SM. Stream-K needs every block resident
 at once, so don't run other kernels on the GPU concurrently.
 
 ```bash
 make ep CUDA_HOME=/usr/local/cuda && build/ep-sm86
 ```
 
-The self-test compares each kernel path, in both modes, with a host
+The self-test compares each kernel path, in every mode (split-K with 2
+and 3 splits), with a host
 reference built from the same bf16 inputs. It then runs a full EP step and
-times data-parallel against Stream-K on EP-sized and large shapes. Shapes must be multiples of 128
+times data-parallel, Stream-K and split-K ×2 on EP-sized and large
+shapes. Shapes must be multiples of 128
 (M, N) and 32 (K).
 
 ## Testing
