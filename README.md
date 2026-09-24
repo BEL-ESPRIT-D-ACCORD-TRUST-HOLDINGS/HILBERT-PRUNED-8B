@@ -1,176 +1,52 @@
-# SemIf (formerly OpenJev)
+# Hilbert
 
-<div align="center">
+## Pruned 4B Decision Model · CUDA Backend · Alloy Governance
 
-**Semantic ifs from open models, on a 3090 at home.**
+**Hilbert** is an experimental pruned 4B semantic-decision model and systems runtime derived from the decision-native architecture demonstrated by SemIf.
 
-*Independent project; not affiliated with Jev or TypeSafe.*
+The project focuses on a narrow execution path:
 
-**Wow! No waitlist.** [Run it in your browser today.](webgpu-demo/index.html)
-
-[![Measured replay: typed decisions appear together while JSON streams token by token](demo/assets/semif-phase1-replay.gif)](demo/index.html)
-
-*Same frozen 4B model · same state · same 21 questions · measured separately, aligned at t=0 in the replay*
-
-</div>
-
-> **Independent research project.** SemIf was formerly called OpenJev. It is not affiliated with or endorsed by TypeSafe. Jev, TypeSafe, and other names and marks are the property of their respective owners. No infringement is intended.
-
-![Some AI company asks you to join a waitlist; SemIf runs in your browser today](assets/semif-no-waitlist.png)
-
-Most agent decisions are small: *route this*, *retry that*, *does the evidence support X?* A chat model can answer them, but it spends time generating text that software immediately parses back into an `if` statement.
-
-Jev is TypeSafe's closed service for runtime-defined semantic decisions. This project reproduces that **interface pattern** with open models; it does not reproduce Jev's undisclosed model or training.
-
-This baseline reads typed option probabilities directly from a model. No answer sentence, JSON repair, or decoding loop.
-
-### Latest changes
-
-**2026-09-22**
-
-- Added PyTorch/MPS scoring for Apple Silicon — [@dp-IED](https://github.com/dp-IED) in [#15](https://github.com/TheoLeeCJ/SemIf/pull/15).
-- Added a Qwen3.8-27B EXL3 bridge with corrected, committed evidence — [@jkyamog](https://github.com/jkyamog) in [#9](https://github.com/TheoLeeCJ/SemIf/pull/9).
-- Added per-workload temperature calibration and calibrated prediction outputs — [@samarthpatel24](https://github.com/samarthpatel24) in [#19](https://github.com/TheoLeeCJ/SemIf/pull/19).
-
-**2026-09-18**
-
-- Added MiniCPM5 2B and Qwen3.5 4B to the browser demo.
-- Added **Unsloppify site**, a switch to a conventional interface.
-
-## Quick start
-
-**Apple Silicon:** use the native [MLX backend](docs/MLX.md) for direct scoring,
-serial prefix reuse, and parallel shared-state decisions on macOS arm64.
-Install `pip install -e '.[test,mlx]'` and add `--backend mlx` to the scorer command.
-PyTorch/MPS (`--device mps`) is also supported for direct, serial, and shared modes — see
-[Apple Silicon](docs/APPLE_SILICON.md).
-
-Python 3.10+, CUDA, and a GPU that can hold a 4B BF16 model:
-
-```bash
-python -m venv .venv
-. .venv/bin/activate
-export HF_HOME=/path/to/large-drive/huggingface
-pip install -e '.[test]'
+```text
+state + question + declared options
+              │
+              ▼
+       Hilbert 4B Model
+              │
+              ▼
+       typed option scores
+              │
+       ┌──────┴──────┐
+       ▼             ▼
+    CUDA          Governance
+   Backend          Layer
+       │             │
+       ▼             ▼
+   Kernels         Alloy
+       │          constraints
+       └──────┬──────┘
+              ▼
+        Auditable Result
 ```
 
-**CPU only:** the llama.cpp backend scores the same prompts from a local GGUF
-checkpoint with no CUDA device. Install `pip install -e '.[test,llamacpp]'`,
-fetch a GGUF (for example `Qwen_Qwen3.5-4B-Q4_K_M.gguf` from
-`bartowski/Qwen_Qwen3.5-4B-GGUF`), and add `--backend llamacpp --gguf
-/path/to/model.gguf`; `--llama-threads` caps the CPU threads. Prompt
-construction stays on the pinned reference tokenizer, so `prompt_sha256`
-matches the Torch backend row for row; scores carry the GGUF checksum and are
-conditional on the quantized weights. Direct and prefix-cached execution can
-have small numerical differences from different llama.cpp evaluation paths;
-compare decisions or probabilities with a tolerance rather than raw logits
-bit for bit. One loaded backend owns one stateful scoring context.
+> **Status:** Experimental research implementation.
+> Model pruning, distillation, CUDA kernels, and Alloy governance specifications must be independently benchmarked and verified before production claims are made.
 
-Run the owned examples:
+---
 
-```bash
-CUDA_VISIBLE_DEVICES=0 semif-score \
-  --mode direct \
-  --model Qwen/Qwen3.5-4B \
-  --revision 851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a \
-  --input examples/decisions.jsonl \
-  --output results.jsonl
+## 1. What Hilbert Is
+
+Hilbert treats many AI workloads as **typed decisions rather than text-generation problems**.
+
+Instead of asking a model to generate:
+
+```text
+"The request should be routed to account-access support because..."
 ```
 
-Each result contains typed option scores, timing, the exact model revision, and a prompt hash.
-
-If every row has the same exact state, switch to `--mode shared` to prefill it once and evaluate the criteria in parallel.
-
-## How it works
-
-```mermaid
-flowchart LR
-    S[Unstructured state] --> M[4B model]
-    C[Runtime criteria] --> M
-    O[Typed options] --> M
-    M -- native option logits --> P[Probabilities]
-```
-
-- **Runtime-defined:** criteria and option descriptions arrive with the request.
-- **Decision-native:** one forward pass reads declared option logits; no answer token is sampled.
-- **Shared-state aware:** one long state can be prefetched once, then branched across many criteria.
-- **Auditable:** the owned fixture, exact runners, row-level outputs, revisions, prompts, and known failures are committed.
-
-## Speed
-
-### Decisions versus a compact generated array
-
-Same frozen Qwen3.5-4B, same owned state, same 21 binary criteria, one RTX 3090:
-
-| Output path | Time | Output tokens | Result |
-|---|---:|---:|---|
-| Direct typed logits, median of 3 | **1.023 s** | **0** | 21 probability pairs |
-| Autoregressive JSON array, median of 3 | 5.332 s | 111 | Valid ordered 21-value array |
-
-The compact generative baseline emits only ordered `"yes"`/`"no"` values—no keys, confidence objects, or explanations. Its median first-token time was 0.489 s, but completing the array took **5.21×** as long as direct readout. All three arrays were valid and identical. Their choices agreed with direct argmax on 18/21 criteria, so this is a systems comparison rather than a claim that the two readouts are semantically equivalent. [Exact prompt, outputs, token timeline, and runs](results/raw/decision-vs-compact-array.json) are committed.
-
-### Reusing a state across 21 decisions
-
-On an owned 37-state × 21-criterion workload:
-
-| Execution path | Decisions/s | 777 decisions |
-|---|---:|---:|
-| Fresh direct scoring | 2.33 | 333.1 s |
-| Serial prefix reuse | 10.75 | 72.3 s |
-| Parallel suffixes | **20.03** | **38.8 s** |
-| Native reranker | 1.86 | 417.3 s |
-
-The owned [37×21 fixture](benchmarks/data/shape777.jsonl), [direct/reuse runner](benchmarks/shape777.py), [reranker runner](benchmarks/shape777_reranker.py), [raw timings](results/raw/shape777-direct.json), and [row-level predictions](results/raw/shape777-direct.predictions.jsonl) are included. The fast reuse paths are experimental: BF16 execution changed 5–6 of 777 argmaxes relative to fresh scoring.
-
-## Quality
-
-### Browser model ladder
-
-| System | Browser artifact | Download | Authored balanced accuracy | Perturbation balanced accuracy | TypeSafe subset agreement |
-|---|---|---:|---:|---:|---:|
-| Qwen3-0.6B | Q8_0 | 639 MB | 0.440 | 0.528 | 0.407 |
-| MiniCPM5-2B | Q4_K_M | 1.56 GB | 0.686 | 0.693 | 0.637 |
-| **Qwen3.5-4B** | Q4_K_M | 3.01 GB | **0.813** | **0.766** | 0.845 |
-| Published Jev | Closed hosted service | — | — | — | **0.883** |
-
-*Native BF16 scores. Browser builds use quantized GGUF. Jev is TypeSafe's published result on the same 102-row subset.*
-
-### General decision baseline
-
-| Frozen workload | Rows | Direct logits (4B BF16) | EXL3 direct (27B, 5 bpw) | Native reranker (4B) | Published Jev |
-|---|---:|---:|---:|---:|---:|
-| Authored decisions, balanced accuracy | 144 | 0.813 | **0.958** | 0.625 | — |
-| WANLI, balanced accuracy | 256 | **0.637** | — | 0.522 | — |
-| TypeSafe selected subset, modal agreement | 102 across 20 cases | **0.845** | — | 0.560 | 0.883 |
-| Every judgment grid, accuracy | 36 | **0.806** | — | 0.694 | — |
-| Every action firewall, composed accuracy | 10 actions | 0.700 | — | 0.700 | — |
-| Every code retrieval, Recall@1 | 6 queries | 1.000 | — | 1.000 | — |
-| Every company knowledge, Recall@1 | 7 queries | 0.929 | — | 0.929 | — |
-
-The reranker remained strong at retrieval ranking, but direct logits were the better general-decision baseline.
-
-The Jev number is read from TypeSafe's published records; we did not run a live Jev endpoint. The comparison covers the 102 rows that could be aligned from public artifacts, not TypeSafe's reported 711-row aggregate.
-
-The [Qwen3.8-27B EXL3 bridge](exl3-bridge/) uses the same 144 authored rows, matching prompt hashes, options, direct-logit readout, and metric as the 4B baseline. It is a system-level quality comparison rather than a controlled model-size or quantization ablation: model family, size, quantization, and runtime all differ. It has not yet been run on the other quality workloads. Across the 777-decision shared-state fixture, its choices agree with the pinned 4B model on 84.43% of rows.
-
-### Calibration
-
-Option probabilities are useful only when their confidence matches observed accuracy. SemIf includes per-workload temperature scaling fitted on labeled decisions:
-
-| Workload | Raw ECE | Calibrated ECE, out of fold | Temperature |
-|---|---:|---:|---:|
-| Authored decisions | 0.068 | **0.038** | 1.23 |
-| WANLI | 0.208 | **0.069** | 2.50 |
-| Every judgments | 0.050 | 0.047 | 1.71 |
-
-Calibration does not change the selected option. The clear improvement is on WANLI; the intervals overlap on the authored and Every workloads. See the [method, caveats, and reproduction commands](docs/CALIBRATION.md).
-
-## Input
+Hilbert evaluates declared alternatives directly:
 
 ```json
 {
-  "id": "route-1",
-  "state": "Customer cannot access an account after a password reset.",
   "question": "Which queue should handle this request?",
   "options": [
     {"id": "access", "description": "Account access support."},
@@ -179,33 +55,657 @@ Calibration does not change the selected option. The clear improvement is on WAN
 }
 ```
 
-Returned probabilities are conditional on the supplied options. Calibrate and validate them on the workload where they will make decisions.
-`state` may also be a nonempty JSON object or array. Direct modes preserve it as structured JSON; reranker mode renders it as document text.
+The resulting computation is conceptually:
 
-## Documentation
+```text
+P(access | state, question, options)
+P(billing | state, question, options)
+```
 
-- [Results](docs/RESULTS.md) — quality, speed, perturbations, and claim boundaries
-- [Method](docs/METHOD.md) — frozen prompts, metrics, and timing scope
-- [Reproduce](docs/REPRODUCE.md) — exact environment, pinned commands, perturbations, and verification
-- [Apple Silicon](docs/APPLE_SILICON.md) — MPS and optional MLX backends
-- [Calibration](docs/CALIBRATION.md) — fitted temperatures, out-of-fold evidence, and application
-- [EXL3 bridge](exl3-bridge/README.md) — quantized 27B runner and committed evidence
-- [Interactive replay](demo/index.html)
-- [Browser-only WebGPU demo](webgpu-demo/index.html) — no waitlist; use it today
-- [Machine-readable summary](results/phase1-summary.json)
-- [Benchmark bundle](benchmarks/README.md) — fixtures, runners, selection IDs, and reproduction commands
-- [Raw results and checksums](results/raw/)
-- [Third-party sources](THIRD_PARTY.md)
+This follows the decision-native pattern documented by the upstream SemIf experiment, where declared option logits are read directly without sampling an answer sentence or running a JSON-repair loop.
 
-## Star history
+---
 
-[![SemIf star history](https://api.star-history.com/svg?repos=TheoLeeCJ/SemIf&type=Date)](https://www.star-history.com/#TheoLeeCJ/SemIf&Date)
+# 2. Hilbert 4B
 
-## Evaluation sources
+Hilbert targets a **pruned/distilled 4B-class model**.
 
-- [TypeSafe public evaluations](https://evals.typesafe.ai/) — public comparison cases used for selected-subset agreement
-- [Every parallel judgment lab](https://typesafe-parallel-judgment-lab.every-4573.chatgpt.site/) and its [downloadable experiment data](https://typesafe-parallel-judgment-lab.every-4573.chatgpt.site/downloads/experiments.json)
-- [WANLI](https://huggingface.co/datasets/alisawuffles/WANLI) — external natural-language inference check
-- [Qwen3-0.6B](https://huggingface.co/Qwen/Qwen3-0.6B), [MiniCPM5-2B](https://huggingface.co/openbmb/MiniCPM5-2B), [Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), [Qwen3-Reranker-4B](https://huggingface.co/Qwen/Qwen3-Reranker-4B), and [Qwen3.8-27B EXL3](https://huggingface.co/turboderp/Qwen3.8-27B-exl3) — frozen baseline and bridge models
+The intended transformation is:
 
-Model weights and third-party source records are not included. Upstream models retain their licenses. Project code is released under the [MIT License](LICENSE).
+```text
+Reference semantic model
+          │
+          ▼
+   distillation data
+          │
+          ▼
+   structured decisions
+          │
+          ▼
+       pruning
+          │
+          ▼
+    Hilbert 4B
+          │
+          ▼
+   CUDA execution
+```
+
+The supplied SemIf baseline demonstrates Qwen3.5-4B as a frozen 4B decision model and reports direct-logit evaluation across multiple decision workloads.
+
+Hilbert's pruning/distillation pipeline is a separate experimental layer and should not be interpreted as evidence that the upstream SemIf model itself was distilled or pruned.
+
+---
+
+# 3. Decision-Native Runtime
+
+Hilbert removes unnecessary text-generation work from decision workloads.
+
+### Conventional generation
+
+```text
+prompt
+  ↓
+model
+  ↓
+tokens
+  ↓
+JSON/text
+  ↓
+parser
+  ↓
+decision
+```
+
+### Hilbert
+
+```text
+state
+  +
+question
+  +
+options
+  ↓
+model forward pass
+  ↓
+typed option scores
+  ↓
+decision
+```
+
+The source experiment reports that direct typed logits produced zero output tokens for its measured decision path, while a compact autoregressive JSON baseline generated 111 tokens for the same 21 binary decisions.
+
+---
+
+# 4. CUDA Backend
+
+Hilbert adds a dedicated CUDA execution backend.
+
+```text
+Hilbert Runtime
+      │
+      ▼
+CUDA Backend
+      │
+ ┌────┼────────────────────┐
+ ▼    ▼                    ▼
+GEMM  Attention            Norm
+ │      │                  │
+ ▼      ▼                  ▼
+Tensor memory        Reduction kernels
+      │
+      ▼
+Typed decision logits
+```
+
+The CUDA layer is intended to provide:
+
+* GPU-resident model execution
+* fused tensor operations
+* reduced intermediate-memory movement
+* optimized matrix multiplication
+* attention kernels
+* normalization kernels
+* reduction kernels
+* option-score extraction
+* deterministic execution modes where supported by the hardware/runtime
+
+CUDA performance numbers should be treated as **unverified until benchmark artifacts are committed**.
+
+---
+
+# 5. CUDA Kernel Boundary
+
+The kernel layer should remain explicit rather than hiding GPU execution behind an opaque abstraction.
+
+Example structure:
+
+```text
+cuda/
+├── attention/
+├── matmul/
+├── normalization/
+├── reduction/
+├── embedding/
+├── logits/
+├── memory/
+└── dispatch/
+```
+
+Each kernel should have:
+
+```text
+kernel specification
+      │
+      ├── input dimensions
+      ├── output dimensions
+      ├── dtype
+      ├── memory contract
+      ├── synchronization requirements
+      ├── numerical tolerance
+      └── test vector
+```
+
+A kernel is not considered verified merely because it compiles or produces plausible output.
+
+---
+
+# 6. Alloy Governance Layer
+
+Alloy is used as a **relational specification and counterexample engine** around the governance model.
+
+It does not prove the neural network's semantic correctness.
+
+The intended separation is:
+
+```text
+Neural computation
+       │
+       ▼
+candidate decision
+       │
+       ▼
+governance specification
+       │
+       ▼
+Alloy analysis
+       │
+ ┌─────┴─────┐
+ ▼           ▼
+SAT         UNSAT
+ │           │
+ ▼           ▼
+counter-    constraint
+example     boundary
+```
+
+Alloy models should specify relationships such as:
+
+```text
+Node
+Decision
+Policy
+Authority
+Grant
+Permission
+Resource
+Evidence
+Revision
+```
+
+Example conceptual invariant:
+
+```text
+No administrative permission exists
+unless an authorized grant relates:
+
+    Node × Grant × Authority × Permission
+```
+
+The Alloy model should be used to search for counterexamples to the governance invariants.
+
+---
+
+# 7. Governance Boundary
+
+Hilbert separates **model output** from **authority**.
+
+A model can produce:
+
+```text
+decision = ALLOW
+```
+
+without possessing authority to authorize the corresponding operation.
+
+The governance layer therefore follows:
+
+```text
+MODEL OUTPUT
+     │
+     ▼
+PROPOSED DECISION
+     │
+     ▼
+POLICY EVALUATION
+     │
+     ▼
+AUTHORITY CHECK
+     │
+     ▼
+GOVERNANCE RESULT
+```
+
+This prevents:
+
+```text
+model confidence
+      ≠
+administrative authority
+```
+
+and:
+
+```text
+prediction
+      ≠
+authorization
+```
+
+---
+
+# 8. Auditable Results
+
+Every decision should preserve sufficient metadata to reproduce the computation.
+
+Recommended result structure:
+
+```json
+{
+  "decision_id": "example-001",
+  "model": "hilbert-4b",
+  "model_revision": "<PINNED_REVISION>",
+  "prompt_sha256": "<HASH>",
+  "options": [
+    {
+      "id": "access",
+      "probability": 0.91
+    },
+    {
+      "id": "billing",
+      "probability": 0.09
+    }
+  ],
+  "selected": "access",
+  "backend": "cuda",
+  "kernel_revision": "<PINNED_REVISION>",
+  "governance_revision": "<PINNED_REVISION>"
+}
+```
+
+The upstream experiment similarly records typed scores, timing, model revision, and prompt hashes as part of its audit-oriented result structure.
+
+---
+
+# 9. Reproducibility
+
+Hilbert should pin:
+
+* model revision
+* tokenizer revision
+* pruning configuration
+* distillation dataset revision
+* CUDA version
+* GPU architecture
+* kernel revision
+* compiler version
+* numerical precision
+* benchmark fixture
+* governance specification revision
+* Alloy model revision
+
+A result without its corresponding revision metadata should be treated as incomplete evidence.
+
+---
+
+# 10. Benchmark Structure
+
+```text
+benchmarks/
+├── decisions/
+├── pruning/
+├── distillation/
+├── cuda/
+├── numerical/
+├── governance/
+├── alloy/
+└── reproduction/
+```
+
+Each benchmark should distinguish:
+
+```text
+correctness
+performance
+numerical agreement
+decision agreement
+governance validity
+```
+
+These properties must not be collapsed into one score.
+
+---
+
+# 11. Model Quality
+
+The upstream SemIf experiment provides a useful reference methodology: fixed workloads, frozen models, explicit metrics, prompt hashes, timing measurements, and committed raw results.
+
+Hilbert should therefore report at minimum:
+
+| Metric                 | Purpose                                 |
+| ---------------------- | --------------------------------------- |
+| Decision accuracy      | Semantic decision quality               |
+| Balanced accuracy      | Class-balanced evaluation               |
+| Calibration error      | Confidence reliability                  |
+| Decision agreement     | Comparison against reference model      |
+| Perturbation stability | Sensitivity to controlled input changes |
+| Kernel numerical error | CUDA correctness                        |
+| Throughput             | Runtime performance                     |
+| Latency                | Per-decision response                   |
+| Memory footprint       | Deployment requirements                 |
+| Governance violations  | Policy-model boundary testing           |
+
+---
+
+# 12. CUDA Correctness
+
+Performance cannot substitute for numerical verification.
+
+For each optimized kernel:
+
+```text
+Reference implementation
+          │
+          ▼
+High-precision / trusted baseline
+          │
+          ▼
+CUDA implementation
+          │
+          ▼
+comparison
+```
+
+Record:
+
+```text
+absolute error
+relative error
+maximum error
+mean error
+ULP difference where applicable
+NaN/Inf behavior
+edge-case behavior
+```
+
+A faster kernel that changes the decision boundary must be treated as a correctness issue, not merely a performance optimization.
+
+---
+
+# 13. Alloy Counterexample Testing
+
+Governance specifications should deliberately attempt to break themselves.
+
+Example challenge classes:
+
+```text
+duplicate authority
+revoked grant
+expired grant
+conflicting policy
+orphaned node
+unauthorized node
+circular authority
+missing evidence
+stale revision
+conflicting permissions
+```
+
+The expected workflow is:
+
+```text
+Invariant
+   ↓
+Alloy model
+   ↓
+bounded analysis
+   ↓
+counterexample
+   ↓
+repair specification
+   ↓
+rerun analysis
+```
+
+An Alloy model finding no counterexample within a finite scope is **not equivalent to an unrestricted mathematical proof**.
+
+---
+
+# 14. Negative-Gate Principle
+
+Hilbert adopts an explicit negative gate:
+
+```text
+UNVERIFIED
+    ↓
+DO NOT PROMOTE TO VERIFIED
+```
+
+Therefore:
+
+```text
+compiles
+    ≠
+correct
+
+passes test
+    ≠
+proven
+
+high confidence
+    ≠
+authority
+
+CUDA speedup
+    ≠
+semantic correctness
+
+Alloy SAT result
+    ≠
+system correctness
+
+absence of a bounded counterexample
+    ≠
+universal proof
+```
+
+This distinction is central to the project.
+
+---
+
+# 15. Repository Composition
+
+Current repository composition:
+
+```text
+Python       44.1%
+C            43.0%
+CUDA          6.5%
+JavaScript    3.5%
+HTML          1.7%
+Alloy         0.8%
+Makefile      0.4%
+```
+
+The stack deliberately keeps the CUDA and Alloy layers visible in the repository rather than hiding them behind a single runtime abstraction.
+
+---
+
+# 16. Directory Layout
+
+```text
+hilbert/
+├── model/
+│   ├── config/
+│   ├── tokenizer/
+│   ├── pruning/
+│   └── distillation/
+│
+├── runtime/
+│   ├── python/
+│   └── c/
+│
+├── cuda/
+│   ├── attention/
+│   ├── matmul/
+│   ├── normalization/
+│   ├── reduction/
+│   ├── logits/
+│   └── dispatch/
+│
+├── alloy/
+│   ├── governance/
+│   ├── authority/
+│   ├── permissions/
+│   └── counterexamples/
+│
+├── benchmarks/
+│   ├── decisions/
+│   ├── cuda/
+│   ├── model/
+│   └── governance/
+│
+├── web/
+│   ├── demo/
+│   └── assets/
+│
+├── docs/
+│   ├── METHOD.md
+│   ├── RESULTS.md
+│   ├── REPRODUCE.md
+│   ├── CUDA.md
+│   └── GOVERNANCE.md
+│
+├── Makefile
+└── README.md
+```
+
+---
+
+# 17. Relationship to SemIf
+
+Hilbert is inspired by the architecture documented in the supplied SemIf project:
+
+* runtime-defined criteria
+* decision-native scoring
+* direct option-logit evaluation
+* shared-state execution
+* reproducible fixtures
+* row-level results
+* pinned model revisions
+* prompt hashing
+* explicit claim boundaries
+
+These characteristics are documented in the supplied project material.
+
+Hilbert adds its own experimental layers:
+
+```text
+SemIf decision architecture
+            │
+            ▼
+       Hilbert 4B
+            │
+      ┌─────┴─────┐
+      ▼           ▼
+   CUDA         Alloy
+   backend      governance
+      │           │
+      └─────┬─────┘
+            ▼
+      Hilbert Runtime
+```
+
+Hilbert should not represent upstream SemIf measurements as measurements of Hilbert.
+
+---
+
+# 18. Claim Discipline
+
+The project distinguishes four states:
+
+```text
+PROPOSED
+    ↓
+IMPLEMENTED
+    ↓
+BENCHMARKED
+    ↓
+INDEPENDENTLY VERIFIED
+```
+
+A feature remains **PROPOSED** until implementation evidence exists.
+
+A feature remains **IMPLEMENTED** until benchmark evidence exists.
+
+A benchmark result remains **BENCHMARKED** until its reproduction procedure is independently confirmed.
+
+This prevents README claims from becoming stronger than the underlying evidence.
+
+---
+
+# 19. License
+
+This repository should include an explicit root license and identify the license applicable to each third-party dependency and model.
+
+Model weights and upstream components retain their respective licenses unless their licenses explicitly permit redistribution.
+
+The supplied SemIf project, for comparison, states that its project code is MIT licensed while upstream model weights retain their own licenses.
+
+---
+
+# 20. Research Status
+
+Hilbert is an experimental systems research project combining:
+
+```text
+4B model compression
++
+decision-native inference
++
+CUDA kernel engineering
++
+GPU execution
++
+formal governance modeling
++
+Alloy counterexample analysis
++
+reproducible benchmarking
+```
+
+The central engineering question is:
+
+> **How small can a decision-oriented model become while retaining measurable decision quality, efficient GPU execution, reproducibility, and an explicit machine-checkable governance boundary?**
+
+The answer must come from the benchmarks, kernel tests, model evaluations, and Alloy counterexamples—not from the README.
+
+---
+
+## Hilbert
+
+```text
+PRUNE THE MODEL.
+EXECUTE THE DECISION.
+VERIFY THE BOUNDARY.
+```
