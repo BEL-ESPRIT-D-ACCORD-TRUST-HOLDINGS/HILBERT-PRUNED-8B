@@ -276,6 +276,40 @@ with the unfused kernels. It also runs a one-token forward step against the
 CPU backend. No speed measurements have been taken, so no speed-up is
 claimed.
 
+### Equilibrium Propagation kernels (`ep/`)
+
+`ep/ep_sm86.cu` is standalone, separate from the decision engine. It holds
+tensor-core kernels for Equilibrium Propagation on a layered Hopfield network
+(Scellier & Bengio 2017).
+
+- **Relaxation step** (`ep_relax`): the forward and feedback matrix
+  multiplies run as one pipelined loop. The fused epilogue adds the bias and
+  the output-layer nudge `beta (y - s)`, clamps to [0, 1], and computes the
+  convergence sum.
+- **Contrastive weight update** (`ep_update`):
+  `W += eta/(beta M) (x_b^T y_b - x_0^T y_0)`, as one matrix multiply. The
+  free-phase operand is negated by flipping its sign bits.
+
+How it is built:
+
+- `mma.sync` BF16 matrix multiplies with FP32 accumulation;
+- `ldmatrix` (including `.trans`), and XOR-swizzled shared memory for
+  conflict-free access;
+- a 3-stage `cp.async.cg` pipeline tracked by `mbarrier`;
+- warp-shuffle reductions.
+
+ptxas reports 128 registers, no spills and no stack, which allows 2 blocks
+of 256 threads per SM.
+
+```bash
+make ep CUDA_HOME=/usr/local/cuda && build/ep-sm86
+```
+
+The self-test compares each kernel path with a host reference built from the
+same bf16 inputs. It then runs a full EP step and times a 4096^3 relaxation
+matrix multiply against the GA10x BF16 peak. Shapes must be multiples of 128
+(M, N) and 32 (K).
+
 ## Testing
 
 ```bash
