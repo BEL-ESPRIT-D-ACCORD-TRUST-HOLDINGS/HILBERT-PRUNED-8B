@@ -1,0 +1,66 @@
+BEL ESPRIT D’ACCORD
+COPyleft NODE GOVERNANCE
+
+LICENSE
+MPL-2.0 applies on a file-by-file basis.
+
+NODE AUTHORITY
+A node may execute and contribute covered code under the
+MPL-2.0 terms.
+
+NETWORK ADMINISTRATION
+Administrative authority over the governed network is NOT
+created by possession of the source code.
+
+Only the Trust may grant:
+    • network-admin authority
+    • node-admin authority
+    • signing authority
+    • admission/revocation authority
+    • governance-policy authority
+
+AUTHORIZATION
+Every administrative grant MUST contain:
+
+    node_id
+    grantor
+    scope
+    permissions
+    issued_at
+    expires_at
+    revocation_reference
+    grantor_signature
+
+FAIL-CLOSED RULE
+
+    No Trust grant
+        ↓
+    No administrative authority
+
+    Invalid signature
+        ↓
+    Reject
+
+    Expired grant
+        ↓
+    Reject
+
+    Revoked grant
+        ↓
+    Reject
+
+COPYLEFT BOUNDARY
+
+    MPL-covered file
+        ↓
+    MPL-2.0 obligations remain attached to that file
+
+    Independent file
+        ↓
+    Its own applicable license governs
+
+    Network authorization
+        ↓
+    Separate governance layer
+        ↓
+    Trust-controlled
