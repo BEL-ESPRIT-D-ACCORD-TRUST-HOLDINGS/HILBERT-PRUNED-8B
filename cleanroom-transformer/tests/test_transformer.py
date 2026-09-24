@@ -113,8 +113,11 @@ def test_prompts_match_committed_predictions(binary):
 def test_parity_with_pytorch(binary):
     pytest.importorskip("torch")
     pytest.importorskip("transformers")
-    done = subprocess.run([sys.executable, str(SM86 / "tools/parity.py"), "--binary", str(binary),
-                           "--tokenizer", str(Path(MODEL_DIR) / "tokenizer.json")], capture_output=True, text=True)
+    args = [sys.executable, str(SM86 / "tools/parity.py"), "--binary", str(binary),
+            "--tokenizer", str(Path(MODEL_DIR) / "tokenizer.json")]
+    if os.environ.get("TRANSFORMER_LLAMA31_TOKENIZER"):
+        args += ["--llama31-tokenizer", os.environ["TRANSFORMER_LLAMA31_TOKENIZER"]]
+    done = subprocess.run(args, capture_output=True, text=True)
     assert done.returncode == 0, done.stdout + done.stderr
 
 
