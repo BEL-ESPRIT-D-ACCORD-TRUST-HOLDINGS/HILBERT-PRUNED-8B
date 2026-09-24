@@ -253,6 +253,31 @@ def check_rows(binary: Path, workdir: Path, tokenizer: Path, rows_path: Path, fa
     check_memory_rows(binary, workdir, tok, model, path, rows_path, failures, label)
 
 
+BENCHMARK_ROWS = ["benchmarks/data/authored144.jsonl", "benchmarks/data/perturbations108.jsonl",
+                  "benchmarks/data/shape777.jsonl"]
+
+
+def check_benchmark_prompts(binary: Path, tokenizer: Path, failures: list[str], label: str) -> None:
+    """`cleanroom-transformer prompt` vs semif_phase1.direct.encode_prompt on every committed benchmark row."""
+    from transformers import AutoTokenizer
+    from semif_phase1.direct import encode_prompt
+
+    tok = AutoTokenizer.from_pretrained(str(tokenizer.parent))
+    for name in BENCHMARK_ROWS:
+        rows = [json.loads(line) for line in (ROOT / name).read_text().splitlines() if line.strip()]
+        out = run(binary, "prompt", "--model", str(tokenizer.parent), "--input", str(ROOT / name),
+                  "--max-tokens", "100000").splitlines()
+        same = 0
+        for row, line in zip(rows, out, strict=True):
+            ids, slots, digest = encode_prompt(tok, row, 100000)
+            got = line.split()
+            same += got[0] == digest and int(got[1]) == len(ids) and [int(x) for x in got[2:]] == slots
+        ok = same == len(rows) == len(out)
+        print(f"  prompts {label:8s} {name}: {same}/{len(rows)} identical {'ok' if ok else 'FAIL'}")
+        if not ok:
+            failures.append(f"prompts {label} {name}")
+
+
 MEMORY_SYSTEM_SUFFIX = " Earlier decisions are listed under memory, oldest first; treat them as context only."
 
 
@@ -326,6 +351,8 @@ def main() -> None:
     parser.add_argument("--tokenizer", type=Path, help="pinned Qwen3.5 tokenizer.json (chat template beside it)")
     parser.add_argument("--llama-tokenizer", type=Path,
                         help="Llama 3 Instruct tokenizer.json (tokenizer_config.json with the chat template beside it)")
+    parser.add_argument("--llama31-tokenizer", type=Path,
+                        help="Llama 3.1/3.3 Instruct tokenizer.json with Meta's official chat template beside it")
     parser.add_argument("--rows", type=Path, default=ROOT / "examples/decisions.jsonl")
     args = parser.parse_args()
     failures: list[str] = []
@@ -343,6 +370,12 @@ def main() -> None:
             check_tokenizer(args.binary, work, args.llama_tokenizer, failures)
             print("Llama 3 row parity vs semif_phase1 prompt encoding + PyTorch:")
             check_rows(args.binary, work, args.llama_tokenizer, args.rows, failures, build_llama(12, 3), "llama")
+        if args.llama31_tokenizer:
+            print("Llama 3.1 prompts on every committed benchmark row vs semif_phase1 (official chat template):")
+            check_benchmark_prompts(args.binary, args.llama31_tokenizer, failures, "llama31")
+            print("Llama 3.1 row parity vs semif_phase1 prompt encoding + PyTorch (3.1 RoPE scaling):")
+            check_rows(args.binary, work, args.llama31_tokenizer, args.rows, failures,
+                       build_llama(13, 3, rope_scaling=True), "llama31")
     if failures:
         raise SystemExit("FAILED: " + "; ".join(failures))
     print("all parity checks passed")

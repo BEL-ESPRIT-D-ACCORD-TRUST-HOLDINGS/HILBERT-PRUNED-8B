@@ -24,7 +24,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | Tokenizer | Verified. Matches the Hugging Face tokenizer on 423 test strings, including Unicode edge cases |
 | CPU forward pass | Verified. Matches PyTorch to within 7e-6 on small random checkpoints, and within 0.1 logits on the real model compared with the committed GPU results |
 | GGUF loading | Verified on the CPU. All 13 supported quant formats dequantize bit-exactly against llama.cpp's reference. Tiny Llama GGUFs match PyTorch (F32) and transformers' GGUF loader (quantized) within 1e-6 relative. A released Llama 3 8B Instruct Q4_K_M file's tokenizer and prompts match Hugging Face on every row tested. **Not yet run with a full 8B GGUF** |
-| Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
+| Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. With Meta's official Llama 3.1 and 3.3 chat templates, prompts match on all 1,029 benchmark rows. **Not yet run with real 8B weights** |
 | Shape contract | Proven with Alloy. Every matrix multiply in the real Qwen3.5-4B and Llama 3 8B forward passes is a valid siphon in `formal/FreehandTensorSiphon.als`, and the head-sharing, RoPE and conv-split rules hold in bounded proofs (see Formal checks) |
 | CUDA forward pass | Compiles for sm_86 with no warnings or register spills. **Not yet run on a GPU.** Run `selftest` (below) before relying on it. It also checks every quantized-weight kernel against the host decoder, and the fused single-token kernels against a double-precision host reference and the unfused kernels |
 
@@ -111,7 +111,7 @@ build/cleanroom-transformer-cuda score --model Meta-Llama-3-8B-Instruct-Q4_K_M.g
 ```
 
 - **Supported:** Llama-architecture files (`general.architecture = llama`)
-  with the `llama-bpe` tokenizer, which covers Llama 3 and 3.1 Instruct.
+  with the `llama-bpe` tokenizer, which covers Llama 3, 3.1 and 3.3 Instruct.
   Weight formats: F32, F16, BF16, Q4_0, Q4_1, Q5_0, Q5_1, Q8_0, Q2_K, Q3_K,
   Q4_K, Q5_K and Q6_K. IQ formats are refused with an error.
 - **Query/key order:** llama.cpp stores the query and key weights with each
@@ -282,7 +282,8 @@ claimed.
 make test                                            # unit tests
 make check-prompts MODEL=qwen35-4b                   # prompts vs committed results (native)
 python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
-  --llama-tokenizer llama3-8b-instruct/tokenizer.json         # vs PyTorch (needs torch, transformers)
+  --llama-tokenizer llama3-8b-instruct/tokenizer.json \
+  --llama31-tokenizer llama3.1-8b-instruct/tokenizer.json      # vs PyTorch (needs torch, transformers)
 python tools/gguf_parity.py --llama-tokenizer llama3-8b-instruct/tokenizer.json \
   [--real-gguf Meta-Llama-3-8B-Instruct-Q4_K_M.gguf]          # GGUF (also needs: pip install gguf)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
@@ -353,8 +354,9 @@ make formal ALLOY_JAR=/path/to/alloy.jar
 - GPU kernels favour accuracy over peak speed. There is no pipelined matrix
   multiply, and the attention cache is float32.
 - Text only. Qwen3.5's vision components are not loaded.
-- Supported chat templates: Qwen3.5 and Llama 3 Instruct. The Llama 3.1
-  template is not supported yet, but Llama 3.1-style RoPE scaling is.
+- Supported chat templates: Qwen3.5, and Llama 3, 3.1 and 3.3 Instruct.
+  Llama 3.2's template inserts the current date, so its prompts change daily,
+  and it is refused.
 - The HTTP server handles one request at a time.
 
 ## Provenance
