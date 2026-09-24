@@ -141,6 +141,18 @@ int decision_encode(const tokenizer_t *t, const chat_format_t *fmt, const decisi
                     encoded_t *out);
 void encoded_free(encoded_t *e);
 
+/* Checks rows against committed prediction records (tools: `verify-prompts`). Only records whose
+ * `mode` is absent or "fresh" are references. Each row must match exactly one such record by id, and
+ * the counts must be equal; malformed records and duplicates fail before any row is encoded. Then
+ * every row must reproduce the record's prompt_sha256, input_tokens and answer_token_ids (and
+ * option_ids, when recorded). Returns 0 only if every row matches. Up to 20 per-row diagnostics
+ * are appended to `diag` (may be NULL). */
+typedef struct {
+    size_t rows, matched, mismatched, encode_errors;
+} verify_report_t;
+int prompt_verify(const tokenizer_t *t, const chat_format_t *fmt, jval *const *rows, size_t n_rows,
+                  jval *const *records, size_t n_records, size_t max_tokens, sbuf_t *diag, verify_report_t *rep);
+
 /* ------------------------------------------------------------- safetensors */
 typedef enum { DT_F32, DT_F16, DT_BF16, DT_GGML } dtype_t;
 

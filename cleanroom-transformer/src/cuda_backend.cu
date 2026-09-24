@@ -4,7 +4,8 @@
 // Mirrors cpu_backend.c (SPEC.md 4) kernel for kernel:
 //   - weights live on the device as bf16; activations are float32;
 //   - GEMM inputs are rounded to bf16 and accumulate in float32 on tensor cores (WMMA m16n16k16);
-//   - attention, gated DeltaNet recurrence, norms and gates run in float32.
+//   - attention, gated DeltaNet recurrence, norms and gates run in float32;
+//   - one-token calls fuse gate/up/SwiGLU, and the final norm is fused into the readout (same numerics).
 // `cleanroom-transformer selftest` compares every kernel family and whole forward passes with the CPU reference.
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
@@ -500,6 +501,96 @@ __global__ void k_readout_q(const float *h, const unsigned char *E, int type, si
     if (threadIdx.x == 0) out[blockIdx.x] = s;
 }
 
+// ---- fused single-token kernels
+// A weight matrix as the kernels see it: dense bf16 rows (bf), or GGUF blocks (q, type, row_bytes).
+struct dview_t {
+    const bf16 *bf;
+    const unsigned char *q;
+    int type;
+    size_t row_bytes;
+};
+
+// One lane's share of dot(W[n], a) for a single activation row, in exactly the order k_gemv (bf16) or
+// k_gemv_q (blocks) use for M = 1, so the warp sum matches gemm_w bit for bit on the same hardware.
+static __device__ __forceinline__ float lane_dot(const dview_t W, int n, const bf16 *__restrict__ a, int K, int lane) {
+    float s = 0.f;
+    if (W.bf) {
+        const bf16 *w = W.bf + (size_t)n * K;
+        if ((K & 7) == 0) {
+            for (int k = lane * 8; k < K; k += 256) {
+                uint4 wr = *(const uint4 *)(w + k), ar = *(const uint4 *)(a + k);
+                const bf16 *wv = (const bf16 *)&wr, *av = (const bf16 *)&ar;
+                float p = 0.f;
+                for (int q = 0; q < 8; q++) p += __bfloat162float(wv[q]) * __bfloat162float(av[q]);
+                s += p;
+            }
+        } else {
+            for (int k = lane; k < K; k += 32) s += __bfloat162float(w[k]) * __bfloat162float(a[k]);
+        }
+    } else {
+        const unsigned char *w = W.q + (size_t)n * W.row_bytes;
+        for (int u = lane; u < K / 32; u += 32) {
+            float y[32];
+            deq_sub(w, W.type, (uint32_t)u, y);
+            const uint4 *ap = (const uint4 *)(a + (size_t)u * 32);
+            float p = 0.f;
+            for (int v = 0; v < 4; v++) {
+                uint4 ar = ap[v];
+                const bf16 *av = (const bf16 *)&ar;
+                for (int q = 0; q < 8; q++) p += y[v * 8 + q] * __bfloat162float(av[q]);
+            }
+            s += p;
+        }
+    }
+    return s;
+}
+
+// Single-token FFN front half: out[n] = bf16(silu(gate[n] . a) * (up[n] . a)), one warp per n, float32
+// accumulation. Replaces two GEMVs, their float32 outputs and k_swiglu when T == 1. `out` must not
+// alias `a`: warps of other blocks are still reading all of `a` while this one writes.
+__global__ void __launch_bounds__(256) k_gateup_swiglu(const bf16 *__restrict__ a, const dview_t G, const dview_t U,
+                                                       bf16 *__restrict__ out, int N, int K) {
+    const int warp = threadIdx.x >> 5, lane = threadIdx.x & 31;
+    const int n = blockIdx.x * 8 + warp;
+    if (n >= N) return;
+    const float g = warp_sum(lane_dot(G, n, a, K, lane));
+    const float u = warp_sum(lane_dot(U, n, a, K, lane));
+    if (lane == 0) out[n] = to_bf16(siluf_(g) * u);
+}
+
+// Final RMSNorm fused with the readout of selected ids: logits[j] = sum_d (x[d] * inv * (off + w[d])) * E[ids[j]][d],
+// inv = 1 / sqrt(mean(x^2) + eps). One block per id; each block recomputes the sum of squares, so the
+// normalized vector is never stored. Any H for bf16 rows; block rows need H % 32 == 0 (always true for GGUF).
+__global__ void __launch_bounds__(256) k_norm_readout(const float *__restrict__ x, const float *__restrict__ w, float off,
+                                                      float eps, const dview_t E, const uint32_t *__restrict__ ids,
+                                                      float *__restrict__ out, int H) {
+    float ss = 0.f;
+    for (int d = threadIdx.x; d < H; d += blockDim.x) ss += x[d] * x[d];
+    ss = block_sum(ss);
+    const float inv = 1.0f / sqrtf(ss / (float)H + eps);
+    float s = 0.f;
+    if (E.bf) {
+        const bf16 *row = E.bf + (size_t)ids[blockIdx.x] * H;
+        for (int d = threadIdx.x; d < H; d += blockDim.x) {
+            const float y = x[d] * inv * (off + w[d]);  // same expression as k_rmsnorm
+            s += y * __bfloat162float(row[d]);
+        }
+    } else {
+        const unsigned char *row = E.q + (size_t)ids[blockIdx.x] * E.row_bytes;
+        for (int u = threadIdx.x; u < H / 32; u += blockDim.x) {
+            float e[32];
+            deq_sub(row, E.type, (uint32_t)u, e);
+            for (int k = 0; k < 32; k++) {
+                const int d = u * 32 + k;
+                const float y = x[d] * inv * (off + w[d]);
+                s += y * e[k];
+            }
+        }
+    }
+    s = block_sum(s);
+    if (threadIdx.x == 0) out[blockIdx.x] = s;
+}
+
 // ------------------------------------------------------------------------------------ backend
 // A device weight matrix [rows, cols]: dense bf16, or raw GGUF blocks with rows in Hugging Face order.
 typedef struct {
@@ -509,6 +600,8 @@ typedef struct {
     uint32_t rows, cols;
     size_t row_bytes;
 } dmat_t;
+
+static dview_t view(const dmat_t *m) { return dview_t{m->bf, m->q, m->type, m->row_bytes}; }
 
 typedef struct {
     uint32_t type, slot;
@@ -532,8 +625,8 @@ typedef struct {
     bool has_snap;
     // scratch for one chunk
     uint32_t *d_tok, *d_ids;
-    float *x, *f0, *f1, *f2, *f3, *f4, *hfin, *d_logits;
-    bf16 *hb;
+    float *x, *f0, *f1, *f2, *f3, *f4, *d_logits;
+    bf16 *hb, *hb_ffn;  // hb_ffn: single-token SwiGLU output (must not alias hb, which k_gateup_swiglu reads)
     size_t bytes;
 } cuda_t;
 
@@ -739,6 +832,13 @@ static int run_layers(cuda_t *c, int T, int pos0) {
         }
         k_rmsnorm<bf16><<<T, 256, 0, st>>>(c->x, L->post_norm, cfg->norm_offset, c->hb, H, cfg->eps);
         CKL();
+        if (T == 1) {
+            // decode step: gate, up and SwiGLU in one pass over the activations, straight to bf16
+            k_gateup_swiglu<<<blocks((size_t)I, 8), 256, 0, st>>>(c->hb, view(&L->gate), view(&L->up), c->hb_ffn, I, H);
+            CKL();
+            if (gemm_w(c, c->hb_ffn, &L->down, c->x, 1, true)) return -1;
+            continue;
+        }
         if (gemm_w(c, c->hb, &L->gate, c->f0, T, false) || gemm_w(c, c->hb, &L->up, c->f1, T, false))
             return -1;
         k_swiglu<<<blocks((size_t)T * I, 256), 256, 0, st>>>(c->f0, c->f1, c->hb, (size_t)T * I);
@@ -772,14 +872,11 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
         b->pos += (size_t)T;
         last_T = T;
     }
-    k_rmsnorm<float><<<1, 256, 0, c->st>>>(c->x + (size_t)(last_T - 1) * H, c->final_norm, cfg->norm_offset, c->hfin, H,
-                                           cfg->eps);
-    CKL();
     if (n_ids) {
+        // final norm of the last position and the selected logits in one kernel
         CK(cudaMemcpyAsync(c->d_ids, ids, n_ids * sizeof(uint32_t), cudaMemcpyHostToDevice, c->st));
-        if (c->lm_head.bf) k_readout<<<n_ids, 256, 0, c->st>>>(c->hfin, c->lm_head.bf, c->d_ids, c->d_logits, H);
-        else k_readout_q<<<n_ids, 128, 0, c->st>>>(c->hfin, c->lm_head.q, c->lm_head.type, c->lm_head.row_bytes,
-                                                   c->d_ids, c->d_logits, H);
+        k_norm_readout<<<n_ids, 256, 0, c->st>>>(c->x + (size_t)(last_T - 1) * H, c->final_norm, cfg->norm_offset,
+                                                 cfg->eps, view(&c->lm_head), c->d_ids, c->d_logits, H);
         CKL();
         CK(cudaMemcpyAsync(logits, c->d_logits, n_ids * sizeof(float), cudaMemcpyDeviceToHost, c->st));
     }
@@ -875,7 +972,7 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
     if (dmalloc(c, (void **)&c->x, CHUNK * H * sizeof(float)) || dmalloc(c, (void **)&c->f0, CHUNK * wide * sizeof(float)) ||
         dmalloc(c, (void **)&c->f1, CHUNK * wide * sizeof(float)) || dmalloc(c, (void **)&c->f2, CHUNK * wide * sizeof(float)) ||
         dmalloc(c, (void **)&c->f3, CHUNK * wide * sizeof(float)) || dmalloc(c, (void **)&c->f4, CHUNK * wide * sizeof(float)) ||
-        dmalloc(c, (void **)&c->hb, CHUNK * hbw * sizeof(bf16)) || dmalloc(c, (void **)&c->hfin, H * sizeof(float)) ||
+        dmalloc(c, (void **)&c->hb, CHUNK * hbw * sizeof(bf16)) || dmalloc(c, (void **)&c->hb_ffn, cfg->intermediate * sizeof(bf16)) ||
         dmalloc(c, (void **)&c->d_tok, CHUNK * sizeof(uint32_t)) || dmalloc(c, (void **)&c->d_ids, 64 * sizeof(uint32_t)) ||
         dmalloc(c, (void **)&c->d_logits, 64 * sizeof(float)))
         return -1;
@@ -962,14 +1059,35 @@ static int selftest_gemm(int verbose, int *failed) {
     return 0;
 }
 
+// Quant formats under test, with the byte offsets of each block's fp16 scale fields (-1: none).
+static const struct { int type; const char *name; int scales[2]; } kinds[] = {
+    {GGML_Q4_0, "Q4_0", {0, -1}}, {GGML_Q4_1, "Q4_1", {0, 2}}, {GGML_Q5_0, "Q5_0", {0, -1}},
+    {GGML_Q5_1, "Q5_1", {0, 2}}, {GGML_Q8_0, "Q8_0", {0, -1}}, {GGML_Q2_K, "Q2_K", {80, 82}},
+    {GGML_Q3_K, "Q3_K", {108, -1}}, {GGML_Q4_K, "Q4_K", {0, 2}}, {GGML_Q5_K, "Q5_K", {0, 2}},
+    {GGML_Q6_K, "Q6_K", {208, -1}},
+};
+
+// `rows` rows of K random but valid values in format kinds[ki]: random quants, small finite scales.
+static unsigned char *random_blocks(size_t ki, int rows, int K, uint64_t *seed) {
+    const int type = kinds[ki].type;
+    const size_t rb = ggml_row_bytes(type, K), nb = rb / ggml_block_bytes(type);
+    unsigned char *hq = (unsigned char *)xmalloc(rb * rows);
+    for (size_t i = 0; i < rb * rows; i++) hq[i] = (unsigned char)lcg(seed);
+    for (size_t blk = 0; blk < nb * rows; blk++)
+        for (int f = 0; f < 2; f++)
+            if (kinds[ki].scales[f] >= 0) {
+                float v = (0.2f + 0.8f * (float)(lcg(seed) % 1000) / 1000.0f) * 0.02f;
+                uint32_t u;  // float -> fp16 (normal range only)
+                memcpy(&u, &v, 4);
+                uint16_t h = (uint16_t)(((u >> 16) & 0x8000) | ((((u >> 23) & 0xff) - 112) << 10) | ((u >> 13) & 0x3ff));
+                unsigned char *p = hq + blk * ggml_block_bytes(type) + kinds[ki].scales[f];
+                p[0] = (unsigned char)h, p[1] = (unsigned char)(h >> 8);
+            }
+    return hq;
+}
+
 // Every quantized kernel against the host decoder (itself bit-exact with llama.cpp's reference).
 static int selftest_quant(int verbose, int *failed) {
-    struct { int type; const char *name; int scales[2]; } kinds[] = {
-        {GGML_Q4_0, "Q4_0", {0, -1}}, {GGML_Q4_1, "Q4_1", {0, 2}}, {GGML_Q5_0, "Q5_0", {0, -1}},
-        {GGML_Q5_1, "Q5_1", {0, 2}}, {GGML_Q8_0, "Q8_0", {0, -1}}, {GGML_Q2_K, "Q2_K", {80, 82}},
-        {GGML_Q3_K, "Q3_K", {108, -1}}, {GGML_Q4_K, "Q4_K", {0, 2}}, {GGML_Q5_K, "Q5_K", {0, 2}},
-        {GGML_Q6_K, "Q6_K", {208, -1}},
-    };
     const int N = 40, K = 512, Ms[] = {5, 40};
     uint64_t seed = 99;
     cuda_t c;
@@ -978,21 +1096,8 @@ static int selftest_quant(int verbose, int *failed) {
     CK(cudaMalloc(&c.wscratch, c.wscratch_elems * sizeof(bf16)));
     for (size_t ki = 0; ki < sizeof kinds / sizeof *kinds; ki++) {
         const int type = kinds[ki].type;
-        const size_t rb = ggml_row_bytes(type, K), nb = rb / ggml_block_bytes(type);
-        unsigned char *hq = (unsigned char *)xmalloc(rb * N);
-        for (size_t i = 0; i < rb * N; i++) hq[i] = (unsigned char)lcg(&seed);
-        for (size_t blk = 0; blk < nb * N; blk++)
-            for (int f = 0; f < 2; f++)
-                if (kinds[ki].scales[f] >= 0) {  // keep scales finite and small
-                    uint16_t h = f32_to_bf16(0.0f);
-                    float v = (0.2f + 0.8f * (float)(lcg(&seed) % 1000) / 1000.0f) * 0.02f;
-                    // float -> fp16 (normal range only)
-                    uint32_t u;
-                    memcpy(&u, &v, 4);
-                    h = (uint16_t)(((u >> 16) & 0x8000) | ((((u >> 23) & 0xff) - 112) << 10) | ((u >> 13) & 0x3ff));
-                    unsigned char *p = hq + blk * ggml_block_bytes(type) + kinds[ki].scales[f];
-                    p[0] = (unsigned char)h, p[1] = (unsigned char)(h >> 8);
-                }
+        const size_t rb = ggml_row_bytes(type, K);
+        unsigned char *hq = random_blocks(ki, N, K, &seed);
         float *ref = (float *)xmalloc(sizeof(float) * N * K);
         for (int r = 0; r < N; r++) ggml_dequantize_row(type, hq + r * rb, ref + (size_t)r * K, K);
         dmat_t W;
@@ -1080,6 +1185,172 @@ static int selftest_quant(int verbose, int *failed) {
     return 0;
 }
 
+// A test weight [rows, K]: bf16 (type < 0) or random GGUF blocks of `type`, with its exact float values in ref.
+typedef struct {
+    dmat_t d;
+    float *ref;
+} tmat_t;
+
+static int tmat_make(tmat_t *t, int type, int rows, int K, uint64_t *seed) {
+    memset(t, 0, sizeof *t);
+    t->d.rows = (uint32_t)rows, t->d.cols = (uint32_t)K;
+    t->ref = (float *)xmalloc(sizeof(float) * rows * K);
+    if (type < 0) {
+        uint16_t *h = (uint16_t *)xmalloc(sizeof(uint16_t) * rows * K);
+        for (size_t i = 0; i < (size_t)rows * K; i++) h[i] = f32_to_bf16(rnd(seed)), t->ref[i] = bf16_to_f32(h[i]);
+        CK(cudaMalloc(&t->d.bf, sizeof(uint16_t) * rows * K));
+        CK(cudaMemcpy(t->d.bf, h, sizeof(uint16_t) * rows * K, cudaMemcpyHostToDevice));
+        free(h);
+        return 0;
+    }
+    size_t ki = 0;
+    while (ki < sizeof kinds / sizeof *kinds && kinds[ki].type != type) ki++;
+    if (ki == sizeof kinds / sizeof *kinds) return set_error("selftest: no generator for type %d", type);
+    unsigned char *hq = random_blocks(ki, rows, K, seed);
+    t->d.type = type, t->d.row_bytes = ggml_row_bytes(type, K);
+    for (int r = 0; r < rows; r++) ggml_dequantize_row(type, hq + r * t->d.row_bytes, t->ref + (size_t)r * K, K);
+    CK(cudaMalloc(&t->d.q, t->d.row_bytes * rows));
+    CK(cudaMemcpy(t->d.q, hq, t->d.row_bytes * rows, cudaMemcpyHostToDevice));
+    free(hq);
+    return 0;
+}
+
+static void tmat_free(tmat_t *t) {
+    cudaFree(t->d.bf), cudaFree(t->d.q);
+    free(t->ref);
+}
+
+static const char *tname(int type) { return type < 0 ? "bf16" : ggml_type_name(type); }
+
+// Distance between two bf16 values in units in the last place (0 = identical bits).
+static int bf16_ulps(uint16_t a, uint16_t b) {
+    int ia = a & 0x8000 ? -(int)(a & 0x7fff) : (int)a, ib = b & 0x8000 ? -(int)(b & 0x7fff) : (int)b;
+    return abs(ia - ib);
+}
+
+// The fused single-token kernels against a double-precision host reference of the same inputs, and
+// against the unfused kernels they replace (which stay in use for T > 1).
+static int selftest_fused(int verbose, int *failed) {
+    const struct { int gate, up, N, K; } ffn[] = {
+        {-1, -1, 37, 4096},               // bf16, 16-byte loads; N not a multiple of 8 warps
+        {-1, -1, 29, 1003},               // bf16, K % 8 != 0: scalar path
+        {GGML_Q4_K, GGML_Q6_K, 21, 512},  // mixed k-quants, as in Q4_K_M files
+        {-1, GGML_Q8_0, 13, 256},         // one dense and one quantized matrix
+    };
+    uint64_t seed = 123;
+    for (size_t ci = 0; ci < sizeof ffn / sizeof *ffn; ci++) {
+        const int N = ffn[ci].N, K = ffn[ci].K;
+        tmat_t G, U;
+        if (tmat_make(&G, ffn[ci].gate, N, K, &seed) || tmat_make(&U, ffn[ci].up, N, K, &seed)) return -1;
+        uint16_t *ha = (uint16_t *)xmalloc(sizeof(uint16_t) * K), *fused = (uint16_t *)xmalloc(sizeof(uint16_t) * N),
+                 *plain = (uint16_t *)xmalloc(sizeof(uint16_t) * N);
+        for (int k = 0; k < K; k++) ha[k] = f32_to_bf16(rnd(&seed));
+        bf16 *da, *dout, *dout2;
+        float *dg, *du;
+        CK(cudaMalloc(&da, sizeof(bf16) * K));
+        CK(cudaMalloc(&dout, sizeof(bf16) * N));
+        CK(cudaMalloc(&dout2, sizeof(bf16) * N));
+        CK(cudaMalloc(&dg, sizeof(float) * N));
+        CK(cudaMalloc(&du, sizeof(float) * N));
+        CK(cudaMemcpy(da, ha, sizeof(bf16) * K, cudaMemcpyHostToDevice));
+        k_gateup_swiglu<<<blocks((size_t)N, 8), 256>>>(da, view(&G.d), view(&U.d), dout, N, K);
+        CKL();
+        cuda_t c;  // M = 1 never needs the dequantization scratch
+        memset(&c, 0, sizeof c);
+        if (gemm_w(&c, da, &G.d, dg, 1, false) || gemm_w(&c, da, &U.d, du, 1, false)) return -1;
+        k_swiglu<<<blocks((size_t)N, 256), 256>>>(dg, du, dout2, (size_t)N);
+        CKL();
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(fused, dout, sizeof(bf16) * N, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(plain, dout2, sizeof(bf16) * N, cudaMemcpyDeviceToHost));
+        double *want = (double *)xmalloc(sizeof(double) * N), scale = 1e-6, worst = 0;
+        int ulps = 0, same = 0;
+        for (int n = 0; n < N; n++) {
+            double g = 0, u = 0;
+            for (int k = 0; k < K; k++) {
+                g += (double)G.ref[(size_t)n * K + k] * bf16_to_f32(ha[k]);
+                u += (double)U.ref[(size_t)n * K + k] * bf16_to_f32(ha[k]);
+            }
+            want[n] = g / (1.0 + exp(-g)) * u;
+            scale = fmax(scale, fabs(want[n]));
+        }
+        for (int n = 0; n < N; n++) {
+            worst = fmax(worst, fabs(bf16_to_f32(fused[n]) - want[n]) / (fabs(want[n]) + 1e-3 * scale));
+            int d = bf16_ulps(fused[n], plain[n]);
+            ulps = d > ulps ? d : ulps;
+            same += d == 0;
+        }
+        // bf16 output: one rounding step (1/256 relative) plus float32 accumulation; same order as the unfused path
+        bool ok = worst <= 1.0 / 128 && ulps <= 1;
+        if (!ok) (*failed)++;
+        if (verbose || !ok)
+            printf("  gate/up+swiglu %-4s/%-4s N=%-3d K=%-5d vs host rel err %.2e; vs unfused %d/%d identical, max %d ulp  %s\n",
+                   tname(ffn[ci].gate), tname(ffn[ci].up), N, K, worst, same, N, ulps, ok ? "ok" : "FAIL");
+        cudaFree(da), cudaFree(dout), cudaFree(dout2), cudaFree(dg), cudaFree(du);
+        free(ha), free(fused), free(plain), free(want);
+        tmat_free(&G), tmat_free(&U);
+    }
+
+    const struct { int type, V, H; float off, eps; } ro[] = {
+        {-1, 50, 1000, 1.0f, 1e-6f},           // bf16 head, H not a multiple of 32 or of the block size
+        {-1, 40, 4096, 0.0f, 1e-5f},           // bf16 head, plain RMSNorm (Llama)
+        {GGML_Q4_K, 30, 512, 0.0f, 1e-5f},     // quantized head
+        {GGML_Q6_K, 30, 768, 1.0f, 1e-6f},     // quantized head, zero-centred norm weights (Qwen3.5)
+    };
+    for (size_t ci = 0; ci < sizeof ro / sizeof *ro; ci++) {
+        const int V = ro[ci].V, H = ro[ci].H, n_ids = 5;
+        const float off = ro[ci].off, eps = ro[ci].eps;
+        uint32_t ids[5] = {0, 7, (uint32_t)(V - 1), 7, 3}, *d_ids;  // repeated id on purpose
+        tmat_t E;
+        if (tmat_make(&E, ro[ci].type, V, H, &seed)) return -1;
+        float *x = (float *)xmalloc(sizeof(float) * H), *w = (float *)xmalloc(sizeof(float) * H), fused[5], plain[5];
+        for (int d = 0; d < H; d++) x[d] = 3.0f * rnd(&seed), w[d] = off ? 0.1f * rnd(&seed) : 1.0f + 0.5f * rnd(&seed);
+        float *dx, *dw, *dh, *dout, *dout2;
+        CK(cudaMalloc(&dx, sizeof(float) * H));
+        CK(cudaMalloc(&dw, sizeof(float) * H));
+        CK(cudaMalloc(&dh, sizeof(float) * H));
+        CK(cudaMalloc(&dout, sizeof fused));
+        CK(cudaMalloc(&dout2, sizeof plain));
+        CK(cudaMalloc(&d_ids, sizeof ids));
+        CK(cudaMemcpy(dx, x, sizeof(float) * H, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(dw, w, sizeof(float) * H, cudaMemcpyHostToDevice));
+        CK(cudaMemcpy(d_ids, ids, sizeof ids, cudaMemcpyHostToDevice));
+        k_norm_readout<<<n_ids, 256>>>(dx, dw, off, eps, view(&E.d), d_ids, dout, H);
+        CKL();
+        k_rmsnorm<float><<<1, 256>>>(dx, dw, off, dh, H, eps);  // the unfused pair
+        CKL();
+        if (E.d.bf) k_readout<<<n_ids, 256>>>(dh, E.d.bf, d_ids, dout2, H);
+        else k_readout_q<<<n_ids, 128>>>(dh, E.d.q, E.d.type, E.d.row_bytes, d_ids, dout2, H);
+        CKL();
+        CK(cudaDeviceSynchronize());
+        CK(cudaMemcpy(fused, dout, sizeof fused, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(plain, dout2, sizeof plain, cudaMemcpyDeviceToHost));
+        double ss = 0;
+        for (int d = 0; d < H; d++) ss += (double)x[d] * x[d];
+        const double inv = 1.0 / sqrt(ss / H + eps);
+        double worst = 0, diff = 0, scale = 1e-6;
+        for (int j = 0; j < n_ids; j++) {
+            double acc = 0, mag = 0;
+            for (int d = 0; d < H; d++) {
+                double term = x[d] * inv * (off + w[d]) * E.ref[(size_t)ids[j] * H + d];
+                acc += term, mag += fabs(term);
+            }
+            scale = fmax(scale, mag);
+            worst = fmax(worst, fabs(acc - fused[j]));
+            diff = fmax(diff, fabs((double)fused[j] - plain[j]));
+        }
+        bool ok = worst / scale <= 1e-5 && diff / scale <= 1e-5;
+        if (!ok) (*failed)++;
+        if (verbose || !ok)
+            printf("  norm+readout %-4s H=%-5d off=%.0f ids=%d  vs host rel err %.2e; vs unfused %.2e  %s\n",
+                   tname(ro[ci].type), H, off, n_ids, worst / scale, diff / scale, ok ? "ok" : "FAIL");
+        cudaFree(dx), cudaFree(dw), cudaFree(dh), cudaFree(dout), cudaFree(dout2), cudaFree(d_ids);
+        free(x), free(w);
+        tmat_free(&E);
+    }
+    return 0;
+}
+
 static void compare(const char *what, const float *ref, const float *got, uint32_t n, int *failed) {
     double worst = 0, scale = 1, pr = 0, pg = 0, mr = ref[0], mg = got[0];
     uint32_t ar = 0, ag = 0;
@@ -1106,13 +1377,15 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
     if (selftest_gemm(verbose, &failed)) return -1;
     printf("GGUF quantized kernels vs host decoder:\n");
     if (selftest_quant(verbose, &failed)) return -1;
+    printf("fused single-token kernels vs host double reference and the unfused kernels:\n");
+    if (selftest_fused(verbose, &failed)) return -1;
     if (n_tokens < 2) n_tokens = 2;
     const config_t *cfg = &m->cfg;
     uint64_t seed = 7;
     uint32_t *tok = (uint32_t *)xmalloc(n_tokens * sizeof *tok), ids[16];
     for (size_t t = 0; t < n_tokens; t++) tok[t] = (uint32_t)(lcg(&seed) % cfg->vocab);
     for (int k = 0; k < 16; k++) ids[k] = (uint32_t)(lcg(&seed) % cfg->vocab);
-    float ref[16], full[16], split[16];
+    float ref[16], full[16], split[16], step[16];
     printf("forward pass, %zu tokens, CPU float32 reference (slow) ...\n", n_tokens);
     fflush(stdout);
     backend_t *cpu = cpu_backend_create(m, n_tokens);
@@ -1137,9 +1410,13 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
     rc = rc || gpu->reset(gpu) || gpu->forward(gpu, tok, half, NULL, 0, NULL) || gpu->snapshot(gpu) ||
          gpu->forward(gpu, tok + half, n_tokens - half, ids, 16, split) || gpu->restore(gpu) ||
          gpu->forward(gpu, tok + half, n_tokens - half, ids, 16, split);
+    // the last token alone runs the T == 1 path: fused gate/up+SwiGLU in every layer
+    rc = rc || gpu->reset(gpu) || gpu->forward(gpu, tok, n_tokens - 1, NULL, 0, NULL) ||
+         gpu->forward(gpu, tok + n_tokens - 1, 1, ids, 16, step);
     if (!rc) {
         compare("cuda vs cpu (full prefill)", ref, full, 16, &failed);
         compare("cuda vs cpu (prefix+restore+suffix)", ref, split, 16, &failed);
+        compare("cuda vs cpu (prefill + 1-token step)", ref, step, 16, &failed);
         printf("  cpu %.2f s, cuda %.4f s for %zu tokens\n", cpu_s, gpu_s, n_tokens);
         // Prefill throughput at a realistic prompt length.
         size_t bench = ctx < 2048 ? ctx : 2048;

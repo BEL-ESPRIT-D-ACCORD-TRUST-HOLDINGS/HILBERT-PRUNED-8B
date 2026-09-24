@@ -17,6 +17,8 @@ static void usage(void) {
             "                                     [--mode direct|shared]\n"
             "  serve     HTTP server              --revision REV [--host 127.0.0.1] [--port 8086] [--max-body BYTES]\n"
             "  prompt    prompt hash, token count and answer tokens per row (no weights needed)  --input rows.jsonl\n"
+            "  verify-prompts  check every row's prompt against committed predictions (no weights needed)\n"
+            "                                     --input rows.jsonl --expected predictions.jsonl\n"
             "  tokenize  token ids of stdin, or of each JSON string line in --input\n"
             "  logits    raw logits               --tokens \"1 2 3\" --ids \"4 5\" [--split N]\n"
             "  selftest  check CUDA kernels against the CPU reference  [--tokens N]\n"
@@ -30,9 +32,9 @@ static void usage(void) {
 }
 
 typedef struct {
-    const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor;
+    const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor, *expected;
     int device, port;
-    bool gpu_bf16;
+    bool gpu_bf16, max_tokens_set;
     size_t max_tokens, max_body, split, n_selftest;
 } args_t;
 
@@ -59,6 +61,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--revision")) a->revision = v;
         else if (!strcmp(k, "--input")) a->input = v;
         else if (!strcmp(k, "--output")) a->output = v;
+        else if (!strcmp(k, "--expected")) a->expected = v;
         else if (!strcmp(k, "--mode")) a->mode = v;
         else if (!strcmp(k, "--backend")) a->backend = v;
         else if (!strcmp(k, "--host")) a->host = v;
@@ -68,7 +71,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--tensor")) a->tensor = v;
         else if (!strcmp(k, "--device")) a->device = atoi(v);
         else if (!strcmp(k, "--port")) a->port = atoi(v);
-        else if (!strcmp(k, "--max-tokens")) a->max_tokens = strtoull(v, NULL, 10);
+        else if (!strcmp(k, "--max-tokens")) a->max_tokens = strtoull(v, NULL, 10), a->max_tokens_set = true;
         else if (!strcmp(k, "--max-body")) a->max_body = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--split")) a->split = strtoull(v, NULL, 10);
         else if (!strcmp(k, "--gpu-weights")) {
@@ -178,6 +181,37 @@ static int cmd_prompt(const args_t *a) {
         encoded_free(&e);
     }
     free(rows);
+    arena_free(&ar);
+    tokenizer_free(t);
+    return rc;
+}
+
+/* Exit status 0 only when every row matches its committed record (see prompt_verify). */
+static int cmd_verify_prompts(const args_t *a) {
+    if (!a->input || !a->expected) return set_error("verify-prompts needs --input and --expected");
+    tokenizer_t *t;
+    chat_format_t fmt;
+    if (chat_format_load(a->model, &fmt) || load_tokenizer(a->model, &t)) return -1;
+    arena_t ar;
+    arena_init(&ar, 1 << 20);
+    jval **rows = NULL, **records = NULL;
+    size_t n_rows = 0, n_records = 0;
+    sbuf_t diag = {0};
+    verify_report_t rep;
+    /* the Python scorer never truncated, so no token limit applies unless one is given */
+    int rc = read_rows(&ar, a->input, &rows, &n_rows) || read_rows(&ar, a->expected, &records, &n_records) ? -1
+             : prompt_verify(t, &fmt, rows, n_rows, records, n_records, a->max_tokens_set ? a->max_tokens : SIZE_MAX,
+                             &diag, &rep);
+    if (diag.len) fputs(diag.data, stderr);
+    if (!rc) printf("%s: %zu/%zu identical prompt_sha256, input_tokens and slots\n", a->input, rep.matched, rep.rows);
+    else {
+        char why[512]; /* set_error formats into the buffer last_error() returns */
+        snprintf(why, sizeof why, "%s", last_error());
+        set_error("%s: %s", a->input, why);
+    }
+    sb_free(&diag);
+    free(rows);
+    free(records);
     arena_free(&ar);
     tokenizer_free(t);
     return rc;
@@ -412,6 +446,7 @@ int main(int argc, char **argv) {
     if (!strcmp(a.cmd, "score")) rc = cmd_score(&a);
     else if (!strcmp(a.cmd, "serve")) rc = cmd_serve(&a);
     else if (!strcmp(a.cmd, "prompt")) rc = cmd_prompt(&a);
+    else if (!strcmp(a.cmd, "verify-prompts")) rc = cmd_verify_prompts(&a);
     else if (!strcmp(a.cmd, "tokenize")) rc = cmd_tokenize(&a);
     else if (!strcmp(a.cmd, "logits")) rc = cmd_logits(&a);
     else if (!strcmp(a.cmd, "selftest")) rc = cmd_selftest(&a);

@@ -154,12 +154,165 @@ static void test_float_repr_roundtrip(void) {
     }
 }
 
+/* ---- prompt verification (tokenizer fixture: tests/fixtures/tiny-qwen, byte-level BPE) */
+static const char *ROW1 = "{\"id\":\"r1\",\"state\":\"s1\",\"question\":\"q?\",\"options\":["
+                          "{\"id\":\"a\",\"description\":\"x\"},{\"id\":\"b\",\"description\":\"y\"}]}";
+static const char *ROW2 = "{\"id\":\"r2\",\"state\":\"s2\",\"question\":\"q?\",\"options\":["
+                          "{\"id\":\"a\",\"description\":\"x\"},{\"id\":\"b\",\"description\":\"y\"},"
+                          "{\"id\":\"c\",\"description\":\"z\"}]}";
+
+typedef struct {
+    tokenizer_t *t;
+    chat_format_t fmt;
+    arena_t ar;
+} vfix_t;
+
+/* A record exactly as the Python scorer writes it, for the given row. */
+static void record_for(vfix_t *f, const char *row_text, sbuf_t *out) {
+    jval *v;
+    decision_t d;
+    encoded_t e;
+    if (json_parse(&f->ar, row_text, strlen(row_text), &v) || decision_validate(v, &d) ||
+        decision_encode(f->t, &f->fmt, &d, 100000, &e)) {
+        CHECK(0, "fixture row: %s", last_error());
+        return;
+    }
+    sb_printf(out, "{\"id\":\"%.*s\",\"prompt_sha256\":\"%s\",\"input_tokens\":%zu,\"answer_token_ids\":[",
+              (int)d.id_len, d.id, e.sha256, e.n);
+    for (uint32_t k = 0; k < d.n_options; k++) sb_printf(out, "%s%u", k ? "," : "", e.slots[k]);
+    sb_puts(out, "],\"option_ids\":[");
+    for (uint32_t k = 0; k < d.n_options; k++) {
+        const jval *id = json_get(d.options[k], "id");
+        sb_printf(out, "%s\"%.*s\"", k ? "," : "", (int)id->n, id->u.str);
+    }
+    sb_puts(out, "]}");
+    encoded_free(&e);
+}
+
+/* Runs prompt_verify on JSON lines; returns its status and fills *rep. */
+static int run_verify(vfix_t *f, const char **rows, size_t nr, const char **recs, size_t nc, size_t max_tokens,
+                      verify_report_t *rep) {
+    jval *rv[8], *cv[8];
+    memset(rep, 0xff, sizeof *rep); /* a failure to call prompt_verify must not look like a result */
+    for (size_t k = 0; k < nr; k++) json_parse(&f->ar, rows[k], strlen(rows[k]), &rv[k]);
+    for (size_t k = 0; k < nc; k++)
+        if (json_parse(&f->ar, recs[k], strlen(recs[k]), &cv[k])) return set_error("bad test record %zu", k);
+    return prompt_verify(f->t, &f->fmt, rv, nr, cv, nc, max_tokens, NULL, rep);
+}
+
+static bool error_has(const char *s) { return strstr(last_error(), s) != NULL; }
+
+static void test_verify(void) {
+    vfix_t f;
+    arena_init(&f.ar, 0);
+    if (tokenizer_load("tests/fixtures/tiny-qwen/tokenizer.json", &f.t) ||
+        chat_format_load("tests/fixtures/tiny-qwen", &f.fmt)) {
+        CHECK(0, "load fixture (run from cleanroom-transformer/): %s", last_error());
+        arena_free(&f.ar);
+        return;
+    }
+    sbuf_t r1 = {0}, r2 = {0};
+    record_for(&f, ROW1, &r1);
+    record_for(&f, ROW2, &r2);
+    const char *rows[] = {ROW1, ROW2};
+    verify_report_t rep;
+    int rc;
+
+    const char *good[] = {r1.data, r2.data};
+    rc = run_verify(&f, rows, 2, good, 2, 100000, &rep);
+    CHECK(rc == 0 && rep.matched == 2 && rep.mismatched == 0, "matching records rejected: %s", last_error());
+
+    /* non-fresh runs are not references and are ignored; fresh ones count */
+    sbuf_t other = {0}, fresh = {0};
+    sb_printf(&other, "{\"mode\":\"serial_prefix\",%s", r2.data + 1);
+    sb_printf(&fresh, "{\"mode\":\"fresh\",%s", r2.data + 1);
+    const char *mixed[] = {r1.data, other.data, fresh.data};
+    rc = run_verify(&f, rows, 2, mixed, 3, 100000, &rep);
+    CHECK(rc == 0 && rep.matched == 2, "mode filtering: %s", last_error());
+
+    /* a missing record must fail even though every present row matches (the old zip() check passed it) */
+    const char *missing[] = {r1.data};
+    rc = run_verify(&f, rows, 2, missing, 1, 100000, &rep);
+    CHECK(rc && error_has("row count mismatch"), "missing record accepted: %s", last_error());
+    rc = run_verify(&f, rows, 1, good, 2, 100000, &rep);
+    CHECK(rc && error_has("row count mismatch"), "missing row accepted: %s", last_error());
+
+    /* same count, but one row has no record of its own */
+    sbuf_t r3 = {0};
+    sb_printf(&r3, "{\"id\":\"r3\",%s", strchr(r2.data, ',') + 1);
+    const char *wrong_id[] = {r1.data, r3.data};
+    rc = run_verify(&f, rows, 2, wrong_id, 2, 100000, &rep);
+    CHECK(rc && error_has("has no committed record"), "unmatched row accepted: %s", last_error());
+
+    const char *dup_rec[] = {r1.data, r1.data};
+    rc = run_verify(&f, rows, 2, dup_rec, 2, 100000, &rep);
+    CHECK(rc && error_has("duplicate fresh record"), "duplicate record accepted: %s", last_error());
+    const char *dup_rows[] = {ROW1, ROW1};
+    rc = run_verify(&f, dup_rows, 2, good, 2, 100000, &rep);
+    CHECK(rc && error_has("more than once"), "duplicate row accepted: %s", last_error());
+
+    /* malformed records fail before encoding */
+    const char *malformed[] = {
+        "[1]",
+        "{\"id\":\"r2\",\"input_tokens\":5,\"answer_token_ids\":[1,2,3]}",
+        "{\"id\":\"r2\",\"prompt_sha256\":\"ABC\",\"input_tokens\":5,\"answer_token_ids\":[1,2,3]}",
+        "{\"id\":\"r2\",\"prompt_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"input_tokens\":\"5\",\"answer_token_ids\":[1,2,3]}",
+        "{\"id\":\"r2\",\"prompt_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"input_tokens\":5}",
+        "{\"id\":\"r2\",\"prompt_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"input_tokens\":5,\"answer_token_ids\":[1,-2,3]}",
+        "{\"id\":\"r2\",\"prompt_sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\","
+        "\"input_tokens\":5,\"answer_token_ids\":[1,2,3],\"option_ids\":[\"a\"]}",
+        "{\"id\":\"r2\",\"mode\":7}",
+    };
+    for (size_t k = 0; k < sizeof malformed / sizeof *malformed; k++) {
+        const char *recs[] = {r1.data, malformed[k]};
+        rc = run_verify(&f, rows, 2, recs, 2, 100000, &rep);
+        CHECK(rc && error_has("record 2") && rep.matched == 0, "malformed record %zu accepted: %s", k, last_error());
+    }
+
+    /* per-field mismatches are counted, not skipped */
+    const char *fields[][2] = {{"\"prompt_sha256\":\"", "prompt_sha256"},
+                               {"\"input_tokens\":", "input_tokens"},
+                               {"\"answer_token_ids\":[", "answer_token_ids"},
+                               {"\"option_ids\":[\"", "option_ids"}};
+    for (size_t k = 0; k < 4; k++) {
+        sbuf_t bad = {0};
+        sb_puts(&bad, r2.data);
+        char *at = strstr(bad.data, fields[k][0]) + strlen(fields[k][0]);
+        /* change one character, keeping the JSON valid (numbers never gain a leading zero) */
+        *at = *at == 'a' ? 'q' : *at == '1' ? '2' : (*at >= '0' && *at <= '9') ? '1' : '0';
+        const char *recs[] = {r1.data, bad.data};
+        rc = run_verify(&f, rows, 2, recs, 2, 100000, &rep);
+        CHECK(rc && rep.matched == 1 && rep.mismatched == 1 && error_has("1 of 2 rows differ"), "changed %s accepted: %s",
+              fields[k][1], last_error());
+        sb_free(&bad);
+    }
+
+    /* encoding failures are failures: token limit, and an invalid row */
+    rc = run_verify(&f, rows, 2, good, 2, 10, &rep);
+    CHECK(rc && rep.encode_errors == 2 && rep.matched == 0, "over-limit rows accepted: %s", last_error());
+    const char *invalid[] = {ROW1, "{\"id\":\"r2\",\"state\":\"s\",\"question\":\"q\",\"options\":[]}"};
+    rc = run_verify(&f, invalid, 2, good, 2, 100000, &rep);
+    CHECK(rc && rep.encode_errors == 1 && rep.matched == 1, "invalid row accepted: %s", last_error());
+
+    sb_free(&r1);
+    sb_free(&r2);
+    sb_free(&r3);
+    sb_free(&other);
+    sb_free(&fresh);
+    tokenizer_free(f.t);
+    arena_free(&f.ar);
+}
+
 int main(void) {
     test_sha256();
     test_json();
     test_unicode();
     test_rows();
     test_float_repr_roundtrip();
+    test_verify();
     if (failures) {
         printf("%d unit check(s) failed\n", failures);
         return 1;
