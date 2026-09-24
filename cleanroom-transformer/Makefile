@@ -6,6 +6,7 @@
 #   make check-prompts MODEL=DIR   every committed benchmark prompt vs its recorded hash (tokenizer only)
 #   make cuda-check compile the CUDA code for sm_86 without linking a binary
 #   make formal     Alloy checks of the shape contract (needs java; ALLOY_JAR or a download)
+#   make OQS=DIR    also link liboqs (installed under DIR) for Falcon-512 memory signatures
 
 CC        ?= cc
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
@@ -17,8 +18,13 @@ CFLAGS  += -std=c11 -Wall -Wextra -Wno-unused-parameter -Isrc
 OMP     ?= -fopenmp
 LDLIBS  += -lm
 
+ifneq ($(OQS),)
+CFLAGS  += -DUSE_OQS -I$(OQS)/include
+LDLIBS  := $(wildcard $(OQS)/lib/liboqs.a $(OQS)/lib64/liboqs.a) $(if $(wildcard $(OQS)/lib*/liboqs.a),,-L$(OQS)/lib -loqs) $(LDLIBS)
+endif
+
 HOST_SRC := src/base.c src/json.c src/sha256.c src/unicode.c src/tokenizer.c src/prompt.c \
-            src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c src/verify.c src/shake256.c src/memory.c
+            src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c src/verify.c src/shake256.c src/memory.c src/sign.c
 BUILD := build
 
 .PHONY: all cuda cuda-check test check-prompts formal clean
@@ -41,7 +47,7 @@ $(BUILD)/gpu/cuda_backend.o: src/cuda_backend.cu src/transformer.h src/ops_commo
 	$(NVCC) -std=c++17 -O3 $(CUDA_ARCH) -Isrc -DUSE_CUDA -Xcompiler -Wall -c $< -o $@
 
 $(BUILD)/cleanroom-transformer-cuda: $(patsubst src/%.c,$(BUILD)/gpu/%.o,$(HOST_SRC) src/main.c) $(BUILD)/gpu/cuda_backend.o
-	$(NVCC) $(CUDA_ARCH) -Xcompiler $(OMP) $^ -o $@ -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib -lcudart -lm
+	$(NVCC) $(CUDA_ARCH) -Xcompiler $(OMP) $^ -o $@ -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib -lcudart $(LDLIBS)
 
 cuda: $(BUILD)/cleanroom-transformer-cuda
 cuda-check: $(BUILD)/gpu/cuda_backend.o

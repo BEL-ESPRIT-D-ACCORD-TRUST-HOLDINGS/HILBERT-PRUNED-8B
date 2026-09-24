@@ -20,6 +20,7 @@ typedef struct {
     float **conv_snap, **S_snap;
     size_t snap_pos;
     bool has_snap;
+    float *last_h; /* final-normalized hidden state at the last position of the latest forward */
 } cpu_t;
 
 static void widen_row(const wmat_t *w, uint32_t r, float *out) { wmat_row_f32(w, r, out); }
@@ -250,6 +251,7 @@ static int cpu_forward(backend_t *b, const uint32_t *tokens, size_t T, const uin
         matmul(&L->down, g, T, x, true);
     }
     rmsnorm(x + (T - 1) * H, m->final_norm, cfg->norm_offset, h, H, cfg->eps);
+    memcpy(c->last_h, h, H * sizeof *h);
     float *row = xmalloc(H * sizeof *row);
     for (uint32_t k = 0; k < n_ids; k++) {
         widen_row(&m->lm_head, ids[k], row);
@@ -289,8 +291,15 @@ static int cpu_restore(backend_t *b) {
     return 0;
 }
 
+static int cpu_last_hidden(backend_t *b, float *out) {
+    cpu_t *c = (cpu_t *)b;
+    memcpy(out, c->last_h, c->m->cfg.hidden * sizeof *out);
+    return 0;
+}
+
 static void cpu_destroy(backend_t *b) {
     cpu_t *c = (cpu_t *)b;
+    free(c->last_h);
     const config_t *cfg = &c->m->cfg;
     for (uint32_t l = 0; l < cfg->n_full; l++) free(c->kc[l]), free(c->vc[l]);
     for (uint32_t l = 0; l < cfg->n_linear; l++) free(c->conv[l]), free(c->S[l]), free(c->conv_snap[l]), free(c->S_snap[l]);
@@ -302,7 +311,9 @@ backend_t *cpu_backend_create(const model_t *m, size_t max_seq) {
     const config_t *cfg = &m->cfg;
     cpu_t *c = xcalloc(1, sizeof *c);
     c->m = m;
-    c->base = (backend_t){"cpu-f32", cpu_reset, cpu_forward, cpu_snapshot, cpu_restore, cpu_destroy, 0, max_seq};
+    c->base = (backend_t){"cpu-f32", cpu_reset, cpu_forward, cpu_snapshot, cpu_restore, cpu_destroy, 0, max_seq,
+                          cpu_last_hidden};
+    c->last_h = xcalloc(cfg->hidden, sizeof(float));
     size_t kvw = (size_t)cfg->n_kv_heads * cfg->head_dim;
     size_t C = 2 * (size_t)cfg->lin_k_heads * cfg->lin_k_dim + (size_t)cfg->lin_v_heads * cfg->lin_v_dim;
     size_t Ssz = (size_t)cfg->lin_v_heads * cfg->lin_k_dim * cfg->lin_v_dim;

@@ -286,7 +286,21 @@ decision to a memory file. The default behaviour (no `--memory`) and the
 One JSON object per line, in this key order: `seq`, `time_us`, `id`,
 `question`, `answer` (option id of the highest probability), `answer_text`
 (its description), `option_ids`, `probabilities`, `prompt_sha256`,
-`prompt_version`, `revision`, `recalled`, `prev`.
+`prompt_version`, `revision`, `recalled`, then the optional `meta` and
+`vector`, then `prev`.
+
+- **`meta`.** The `--memory-meta` object, stored in canonical
+  `json.dumps` form (for example a session id or sampling settings).
+- **`vector`.** Written with `--memory-vectors yes`, as
+  `{"dim": H, "f32le_b64": ...}`. It holds the final-normalized hidden state
+  at the last prompt position (the readout input; section 5), L2-normalized,
+  as little-endian float32 values in standard base64. It is the state the
+  answer is read from, so it describes the decision itself.
+  - It comes from the backend that scored the row. CUDA values differ from
+    the CPU values in the last digits, and the entry hash covers the stored
+    bytes.
+  - `memory-similar` ranks the stored entries by cosine similarity to the
+    latest entry for an id.
 
 - `entry_hash = SHAKE256(0x00 || line)[0:64]`, over the stored bytes without
   the newline.
@@ -386,3 +400,21 @@ them. The leaves are private.
 `zk/memory_zk_inputs.js` builds the input from a memory file. The Poseidon
 root is a separate commitment from the SHAKE256 `root`, and the engine does
 not compute it. Publish both together.
+
+### 6.6 Signed checkpoints
+
+With `make OQS=DIR`, the engine is linked against liboqs.
+
+- **Commands.**
+  - `memory-keygen` writes a Falcon-512 key pair.
+  - `memory-sign` signs the message
+    `"cleanroom-transformer memory root v1\0" || root || count` (count as
+    8 bytes, little endian).
+  - `score --sign-key` appends such a signature to `FILE.sigs` after each
+    run.
+- **Coverage.** One signature over `(root, count)` covers every entry, the
+  chain and both trees.
+- **Verification.** `memory-verify` checks the signature against the public
+  key embedded in it. The signer is only identified when `--public-key`
+  pins the expected key.
+- **Without liboqs.** The commands fail. There is no stand-in signer.
