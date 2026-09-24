@@ -358,7 +358,7 @@ static void test_memory(void) {
         decision_t d;
         json_parse(&a, rows[k], strlen(rows[k]), &v);
         decision_validate(v, &d);
-        CHECK(!memory_append(m, &d, d.n_options == 2 ? p2 : p3, "00", PROMPT_VERSION, "rev", 0), "append: %s", last_error());
+        CHECK(!memory_append(m, &d, d.n_options == 2 ? p2 : p3, "00", PROMPT_VERSION, "rev", 0, NULL), "append: %s", last_error());
     }
     sbuf_t recall = {0}, root1 = {0}, root2 = {0}, proof = {0}, summary = {0};
     memory_recall_json(m, 2, &recall);
@@ -390,7 +390,7 @@ static void test_memory(void) {
         proof.len = 0, summary.len = 0;
         jval *pv;
         CHECK(!memory_prove_id(m, ids[k], 2, &proof) && !json_parse(&a, proof.data, proof.len, &pv) &&
-                  !memory_verify_proof(pv, NULL, &summary),
+                  !memory_verify_proof(pv, NULL, NULL, &summary),
               "prove/verify %s: %s", ids[k], last_error());
         CHECK(strstr(summary.data, k ? "never recorded" : "latest entry") != NULL, "summary %s", summary.data);
         if (k == 0) CHECK(strstr(proof.data, "\\\"seq\\\": 2") != NULL, "latest entry for r1 should be seq 2");

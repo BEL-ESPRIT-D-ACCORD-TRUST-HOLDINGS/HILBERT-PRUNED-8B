@@ -172,6 +172,16 @@ build/cleanroom-transformer memory-root   --memory memory.jsonl                 
 build/cleanroom-transformer memory-prove  --memory memory.jsonl --id route-1 > proof.json
 build/cleanroom-transformer memory-prove  --memory memory.jsonl --from T1 --to T2 > gap.json
 build/cleanroom-transformer memory-verify --proof proof.json --root ROOT        # no memory file needed
+
+# metadata and hidden-state vectors with every entry; then "which past decisions look like this one?"
+build/cleanroom-transformer score ... --memory memory.jsonl --memory-meta '{"session": "0x7F9A"}' --memory-vectors yes
+build/cleanroom-transformer memory-similar --memory memory.jsonl --id route-1 --last 5
+
+# Falcon-512 signatures over the memory root (post-quantum; needs liboqs, see below)
+make BUILD=build/oqs OQS=/path/to/liboqs
+build/oqs/cleanroom-transformer memory-keygen --key-out alice             # alice.key (0600) + alice.pub
+build/oqs/cleanroom-transformer score ... --memory memory.jsonl --sign-key alice.key   # checkpoint in memory.jsonl.sigs
+build/oqs/cleanroom-transformer memory-verify --proof sig.json --root ROOT --public-key alice.pub
 ```
 
 - **Record.** `--memory FILE` appends each decision to a JSONL file. Each
@@ -192,6 +202,18 @@ build/cleanroom-transformer memory-verify --proof proof.json --root ROOT        
     window.
 
   Proofs are checked on their own against a published root.
+- **Metadata and vectors.**
+  - `--memory-meta` stores a JSON object with every entry.
+  - `--memory-vectors yes` stores the final hidden state that each answer was
+    read from, L2-normalized. It matches PyTorch within 4e-7 in `parity.py`.
+  - `memory-similar` finds the past decisions whose vectors are closest.
+- **Signatures (optional).** Falcon-512 through
+  [liboqs](https://github.com/open-quantum-safe/liboqs). One signature over
+  the root covers the whole memory.
+  - To build liboqs with only Falcon:
+    `cmake -S liboqs -B b -DOQS_MINIMAL_BUILD=SIG_falcon_512 -DOQS_BUILD_ONLY_LIB=ON -DOQS_USE_OPENSSL=OFF -DCMAKE_INSTALL_PREFIX=$HOME/oqs && cmake --build b --target install`,
+    then `make OQS=$HOME/oqs`.
+  - Without liboqs the signing commands refuse to run.
 - **Zero knowledge (optional).** `zk/` has a Circom circuit that proves a run
   of up to 8 consecutive entries exists, without revealing them:
   ```bash
@@ -268,7 +290,8 @@ TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of th
 ```
 
 The memory tests compare the engine with an independent Python version of
-the same trees (`tests/memory_reference.py`). `parity.py` also checks
+the same trees (`tests/memory_reference.py`). The signature tests run when
+`LIBOQS_DIR` is set. `parity.py` also checks
 `--recall` prompts and probabilities against PyTorch.
 
 `make check-prompts` runs `cleanroom-transformer verify-prompts` on each

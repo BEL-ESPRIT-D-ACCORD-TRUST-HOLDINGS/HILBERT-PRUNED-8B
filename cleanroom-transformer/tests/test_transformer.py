@@ -145,14 +145,22 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import memory_reference as memref  # noqa: E402
 
 
-def _memory_file(path, entries):
-    """Writes a valid hash-chained memory file; entries are (id, question, answer_text, time_us)."""
+def _memory_file(path, entries, vectors=None, extra=None):
+    """Writes a valid hash-chained memory file; entries are (id, question, answer_text, time_us).
+    vectors: optional list of float lists; extra: optional dict merged into every entry."""
+    import base64
+    import struct
     prev, lines = "00" * memref.HL, []
     for seq, (id_, question, answer, t) in enumerate(entries):
-        line = json.dumps({"seq": seq, "time_us": t, "id": id_, "question": question, "answer": "a",
-                           "answer_text": answer, "option_ids": ["a", "b"], "probabilities": [0.5, 0.5],
-                           "prompt_sha256": "0" * 64, "prompt_version": "direct-options-v1", "revision": "r",
-                           "recalled": 0, "prev": prev}, ensure_ascii=False).encode()
+        e = {"seq": seq, "time_us": t, "id": id_, "question": question, "answer": "a", "answer_text": answer,
+             "option_ids": ["a", "b"], "probabilities": [0.5, 0.5], "prompt_sha256": "0" * 64,
+             "prompt_version": "direct-options-v1", "revision": "r", "recalled": 0}
+        e.update(extra or {})
+        if vectors:
+            v = vectors[seq]
+            e["vector"] = {"dim": len(v), "f32le_b64": base64.b64encode(struct.pack("<%df" % len(v), *v)).decode()}
+        e["prev"] = prev
+        line = json.dumps(e, ensure_ascii=False).encode()
         lines.append(line)
         prev = memref.h_leaf(line).hex()
     path.write_bytes(b"".join(line + b"\n" for line in lines))
@@ -257,3 +265,61 @@ def test_memory_detects_tampering(binary, tmp_path, damage):
         mem.write_bytes(b"".join(line + b"\n" for line in lines)[: -3 if damage == "truncate" else None])
     done = _run(binary, "memory-root", "--memory", str(mem))
     assert done.returncode == 1, done.stdout
+
+
+def test_memory_similar(binary, tmp_path):
+    mem = tmp_path / "mem.jsonl"
+    vectors = [[1, 0, 0], [0, 1, 0], [0.9, 0.1, 0], [-1, 0, 0]]
+    _memory_file(mem, ENTRIES, vectors, extra={"meta": {"session": "s1"}})
+    out = _run(binary, "memory-similar", "--memory", str(mem), "--id", "q2", "--last", "3").stdout.splitlines()
+    hits = [json.loads(line) for line in out]
+    assert [h["seq"] for h in hits] == [2, 0, 3]  # the query (q2 = seq 1) is excluded; best first
+    # the latest entry of q1 is seq 2: its nearest neighbour is seq 0, its opposite is last
+    hits = [json.loads(line) for line in _run(binary, "memory-similar", "--memory", str(mem), "--id", "q1").stdout.splitlines()]
+    assert hits[0]["seq"] == 0 and hits[-1]["seq"] == 3 and abs(hits[0]["similarity"] - 0.9 / (0.82 ** 0.5)) < 1e-6
+    none = _run(binary, "memory-similar", "--memory", str(tmp_path / "plain.jsonl"), "--id", "q1")
+    assert none.returncode == 1
+
+
+@pytest.mark.parametrize("bad", [{"meta": [1]}, {"vector": {"dim": 3, "f32le_b64": "AAAA"}},
+                                 {"vector": {"dim": 0, "f32le_b64": ""}}, {"vector": {"dim": 1, "f32le_b64": "AAA="}}])
+def test_memory_rejects_malformed_extras(binary, tmp_path, bad):
+    mem = tmp_path / "mem.jsonl"
+    _memory_file(mem, ENTRIES[:1], extra=bad)
+    assert _run(binary, "memory-root", "--memory", str(mem)).returncode == 1
+
+
+def test_memory_signing_needs_liboqs(binary, tmp_path):
+    done = _run(binary, "memory-keygen", "--key-out", str(tmp_path / "k"))
+    if "built without liboqs" not in done.stderr:
+        pytest.skip("this binary was built with liboqs")
+    assert done.returncode == 1 and not (tmp_path / "k.key").exists()
+
+
+@pytest.mark.skipif(not os.environ.get("LIBOQS_DIR"), reason="set LIBOQS_DIR to a liboqs install with Falcon-512")
+def test_memory_falcon_signatures(tmp_path):
+    subprocess.run(["make", "-C", str(SM86), "-s", "BUILD=build/oqs", f"OQS={os.environ['LIBOQS_DIR']}",
+                    "build/oqs/cleanroom-transformer"], check=True, capture_output=True)
+    oqs = SM86 / "build/oqs/cleanroom-transformer"
+    mem = tmp_path / "mem.jsonl"
+    lines = _memory_file(mem, ENTRIES)
+    root = memref.roots(lines)["root"].hex()
+    for who in ("alice", "mallory"):
+        assert _run(oqs, "memory-keygen", "--key-out", str(tmp_path / who)).returncode == 0
+    assert oct((tmp_path / "alice.key").stat().st_mode & 0o777) == "0o600"
+    assert _run(oqs, "memory-keygen", "--key-out", str(tmp_path / "alice")).returncode == 1  # never overwrites
+    sig = json.loads(_run(oqs, "memory-sign", "--memory", str(mem), "--key", str(tmp_path / "alice.key")).stdout)
+    assert sig["root"] == root and sig["count"] == 4 and sig["alg"] == "Falcon-512"
+
+    def verify(p, *args):
+        path = tmp_path / "sig.json"
+        path.write_text(json.dumps(p))
+        return _run(oqs, "memory-verify", "--proof", str(path), *args)
+
+    assert verify(sig, "--root", root, "--public-key", str(tmp_path / "alice.pub")).returncode == 0
+    assert "UNTRUSTED" in verify(sig).stdout
+    assert verify(sig, "--public-key", str(tmp_path / "mallory.pub")).returncode == 1
+    flipped = bytearray.fromhex(sig["signature"])
+    flipped[40] ^= 1
+    for forged in (dict(sig, count=5), dict(sig, root="00" * 64), dict(sig, signature=flipped.hex())):
+        assert verify(forged).returncode == 1

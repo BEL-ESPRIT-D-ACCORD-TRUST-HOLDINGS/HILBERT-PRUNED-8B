@@ -625,7 +625,8 @@ typedef struct {
     bool has_snap;
     // scratch for one chunk
     uint32_t *d_tok, *d_ids;
-    float *x, *f0, *f1, *f2, *f3, *f4, *d_logits;
+    float *x, *f0, *f1, *f2, *f3, *f4, *d_logits, *d_hidden;
+    int last_T; // rows of x holding the latest forward call's final chunk
     bf16 *hb, *hb_ffn;  // hb_ffn: single-token SwiGLU output (must not alias hb, which k_gateup_swiglu reads)
     size_t bytes;
 } cuda_t;
@@ -872,6 +873,7 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
         b->pos += (size_t)T;
         last_T = T;
     }
+    c->last_T = last_T;
     if (n_ids) {
         // final norm of the last position and the selected logits in one kernel
         CK(cudaMemcpyAsync(c->d_ids, ids, n_ids * sizeof(uint32_t), cudaMemcpyHostToDevice, c->st));
@@ -880,6 +882,21 @@ static int cu_forward(backend_t *b, const uint32_t *tokens, size_t n, const uint
         CKL();
         CK(cudaMemcpyAsync(logits, c->d_logits, n_ids * sizeof(float), cudaMemcpyDeviceToHost, c->st));
     }
+    CK(cudaStreamSynchronize(c->st));
+    return 0;
+}
+
+// Final norm of the last position, on demand: the forward pass itself fuses it into the readout.
+static int cu_last_hidden(backend_t *b, float *out) {
+    cuda_t *c = (cuda_t *)b;
+    const config_t *cfg = &c->m->cfg;
+    const int H = (int)cfg->hidden;
+    if (c->last_T < 1) return set_error("last_hidden: no forward pass yet");
+    CK(cudaSetDevice(c->device));
+    k_rmsnorm<float><<<1, 256, 0, c->st>>>(c->x + (size_t)(c->last_T - 1) * H, c->final_norm, cfg->norm_offset, c->d_hidden,
+                                           H, cfg->eps);
+    CKL();
+    CK(cudaMemcpyAsync(out, c->d_hidden, H * sizeof(float), cudaMemcpyDeviceToHost, c->st));
     CK(cudaStreamSynchronize(c->st));
     return 0;
 }
@@ -974,7 +991,8 @@ static int cu_init(cuda_t *c, const model_t *m, size_t max_seq, int device) {
         dmalloc(c, (void **)&c->f3, CHUNK * wide * sizeof(float)) || dmalloc(c, (void **)&c->f4, CHUNK * wide * sizeof(float)) ||
         dmalloc(c, (void **)&c->hb, CHUNK * hbw * sizeof(bf16)) || dmalloc(c, (void **)&c->hb_ffn, cfg->intermediate * sizeof(bf16)) ||
         dmalloc(c, (void **)&c->d_tok, CHUNK * sizeof(uint32_t)) || dmalloc(c, (void **)&c->d_ids, 64 * sizeof(uint32_t)) ||
-        dmalloc(c, (void **)&c->d_logits, 64 * sizeof(float)))
+        dmalloc(c, (void **)&c->d_logits, 64 * sizeof(float)) ||
+        dmalloc(c, (void **)&c->d_hidden, H * sizeof(float)))
         return -1;
     fprintf(stderr, "cleanroom-transformer: %s (sm_%d%d), weights %.2f GiB (%s), state+scratch %.2f GiB, context %zu\n",
             prop.name, prop.major, prop.minor, weights / 1073741824.0, c->wscratch ? "GGUF blocks kept quantized" : "bf16",
@@ -993,6 +1011,7 @@ extern "C" backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int 
     c->base.snapshot = cu_snapshot;
     c->base.restore = cu_restore;
     c->base.destroy = cu_destroy;
+    c->base.last_hidden = cu_last_hidden;
     c->base.max_seq = max_seq;
     if (cu_init(c, m, max_seq, device) || cu_reset(&c->base)) {
         cudaDeviceReset();
@@ -1392,21 +1411,24 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
     double t0 = now_seconds();
     int rc = cpu->reset(cpu) || cpu->forward(cpu, tok, n_tokens, ids, 16, ref);
     double cpu_s = now_seconds() - t0;
+    float *hc = (float *)xmalloc(cfg->hidden * sizeof(float)), *hg = (float *)xmalloc(cfg->hidden * sizeof(float));
+    rc = rc || cpu->last_hidden(cpu, hc);
     cpu->destroy(cpu);
     if (rc) {
-        free(tok);
+        free(tok), free(hc), free(hg);
         return -1;
     }
     size_t ctx = n_tokens > 2048 ? n_tokens : 2048;
     backend_t *gpu = cuda_backend_create(m, ctx, device, true);
     if (!gpu) {
-        free(tok);
+        free(tok), free(hc), free(hg);
         return -1;
     }
     size_t half = n_tokens / 2;
     t0 = now_seconds();
     rc = gpu->reset(gpu) || gpu->forward(gpu, tok, n_tokens, ids, 16, full);
     double gpu_s = now_seconds() - t0;
+    rc = rc || gpu->last_hidden(gpu, hg); // hidden state for --memory-vectors, after the full prefill
     rc = rc || gpu->reset(gpu) || gpu->forward(gpu, tok, half, NULL, 0, NULL) || gpu->snapshot(gpu) ||
          gpu->forward(gpu, tok + half, n_tokens - half, ids, 16, split) || gpu->restore(gpu) ||
          gpu->forward(gpu, tok + half, n_tokens - half, ids, 16, split);
@@ -1417,6 +1439,12 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
         compare("cuda vs cpu (full prefill)", ref, full, 16, &failed);
         compare("cuda vs cpu (prefix+restore+suffix)", ref, split, 16, &failed);
         compare("cuda vs cpu (prefill + 1-token step)", ref, step, 16, &failed);
+        double dot = 0, nc = 0, ng = 0;
+        for (uint32_t k = 0; k < cfg->hidden; k++) dot += (double)hc[k] * hg[k], nc += (double)hc[k] * hc[k], ng += (double)hg[k] * hg[k];
+        double cosine = nc > 0 && ng > 0 ? dot / sqrt(nc * ng) : 0;
+        bool ok = cosine >= 0.999;  // bf16 GEMM inputs: close in direction, not bit-equal
+        if (!ok) failed++;
+        printf("  %-34s cosine %.6f  %s\n", "cuda vs cpu final hidden state", cosine, ok ? "ok" : "FAIL");
         printf("  cpu %.2f s, cuda %.4f s for %zu tokens\n", cpu_s, gpu_s, n_tokens);
         // Prefill throughput at a realistic prompt length.
         size_t bench = ctx < 2048 ? ctx : 2048;
@@ -1430,7 +1458,7 @@ extern "C" int cuda_selftest(const model_t *m, int device, size_t n_tokens, int 
         free(bt);
     }
     gpu->destroy(gpu);
-    free(tok);
+    free(tok), free(hc), free(hg);
     if (rc) return -1;
     if (failed) return set_error("selftest: %d check(s) failed", failed);
     printf("selftest passed\n");

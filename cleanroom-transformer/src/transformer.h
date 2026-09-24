@@ -174,9 +174,18 @@ typedef struct memory memory_t;
 int memory_open(const char *path, bool writable, memory_t **out);
 void memory_close(memory_t *m);
 size_t memory_count(const memory_t *m);
+/* Optional per-entry extras: a caller-supplied JSON object, and a hidden-state vector. */
+typedef struct {
+    const char *meta; /* canonical JSON object text, or NULL */
+    size_t meta_len;
+    const float *vector; /* or NULL */
+    uint32_t dim;
+} memory_extra_t;
 /* Appends one scored decision (p = option probabilities) and syncs it to disk. */
 int memory_append(memory_t *m, const decision_t *d, const double *p, const char *prompt_sha256,
-                  const char *prompt_version, const char *revision, uint32_t recalled);
+                  const char *prompt_version, const char *revision, uint32_t recalled, const memory_extra_t *x);
+/* Entries whose vectors are most similar (cosine) to the latest one for id, best first. */
+int memory_similar(const memory_t *m, const char *id, size_t id_len, size_t top, sbuf_t *out);
 /* The last n decisions, oldest first, as the prompt's memory array: [{"criterion", "answer"}]. */
 void memory_recall_json(const memory_t *m, uint32_t n, sbuf_t *out);
 void memory_recall_lines(const memory_t *m, const char *id, size_t id_len, size_t last, sbuf_t *out);
@@ -185,8 +194,16 @@ void memory_root_json(const memory_t *m, sbuf_t *out);
 int memory_prove_id(const memory_t *m, const char *id, size_t id_len, sbuf_t *out);
 /* Proof that nothing was recorded with from_us <= time_us <= to_us; fails if something was. */
 int memory_prove_gap(const memory_t *m, uint64_t from_us, uint64_t to_us, sbuf_t *out);
-/* Checks a proof on its own (and against expect_root, hex, when given). */
-int memory_verify_proof(const jval *proof, const char *expect_root, sbuf_t *summary);
+/* Checks a proof or signature on its own, against expect_root (hex) and the trusted public key
+ * file when given. */
+int memory_verify_proof(const jval *proof, const char *expect_root, const char *trusted_pub, sbuf_t *summary);
+void memory_root_bytes(const memory_t *m, uint8_t root[64]);
+
+/* Falcon-512 signatures over (root, count) via liboqs (SPEC.md 6.6); only with make OQS=... */
+bool memory_signing_available(void);
+int memory_keygen(const char *prefix); /* writes prefix.key (0600) and prefix.pub; never overwrites */
+int memory_sign(const memory_t *m, const char *key_path, sbuf_t *out);
+int memory_verify_signature(const jval *proof, const char *expect_root, const char *trusted_pub, sbuf_t *summary);
 
 /* ------------------------------------------------------------- safetensors */
 typedef enum { DT_F32, DT_F16, DT_BF16, DT_GGML } dtype_t;
@@ -336,6 +353,9 @@ struct backend {
     int (*restore)(backend_t *);    /* return to the saved state */
     void (*destroy)(backend_t *);
     size_t pos, max_seq;
+    /* Final-normalized hidden state (the readout input, `hidden` floats) at the last position of
+     * the latest forward call. Optional: NULL when a backend cannot report it. */
+    int (*last_hidden)(backend_t *, float *out);
 };
 
 backend_t *cpu_backend_create(const model_t *m, size_t max_seq);
@@ -356,6 +376,8 @@ typedef struct {
     char revision[128];
     memory_t *memory; /* optional: every scored decision is appended */
     uint32_t recall;  /* > 0: the last `recall` decisions go into each prompt (PROMPT_VERSION_MEMORY) */
+    char *memory_meta; /* canonical JSON object stored with every entry, or NULL */
+    bool memory_vectors; /* store each decision's final hidden state (L2-normalized) */
 } engine_t;
 
 /* Scores one row directly. Appends one JSON result line (no newline). */

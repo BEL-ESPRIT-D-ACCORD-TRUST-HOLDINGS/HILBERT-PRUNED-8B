@@ -282,7 +282,8 @@ def check_memory_rows(binary: Path, workdir: Path, tok, model, path: Path, rows_
         before = [json.loads(line) for line in mem.read_text().splitlines()] if mem.exists() else []
         out = workdir / f"results-{label}-memory-{mode}.jsonl"
         run(binary, "score", "--model", str(path), "--revision", "tiny-random", "--backend", "cpu", "--mode", mode,
-            "--input", str(rows_path), "--output", str(out), "--memory", str(mem), "--recall", "2")
+            "--input", str(rows_path), "--output", str(out), "--memory", str(mem), "--recall", "2",
+            "--memory-vectors", "yes", "--memory-meta", '{"session": "parity", "mode": "%s"}' % mode)
         stored = [json.loads(line) for line in mem.read_text().splitlines()]
         for got in map(json.loads, out.read_text().splitlines()):
             seq = got["memory"]["seq"]
@@ -291,15 +292,24 @@ def check_memory_rows(binary: Path, workdir: Path, tok, model, path: Path, rows_
             recalled = [{"criterion": e["question"], "answer": e["answer_text"]} for e in history[-2:]]
             ids, slots, digest = encode_memory_prompt(tok, rows[got["id"]], recalled)
             with torch.no_grad():
-                logits = model(input_ids=torch.tensor([ids])).logits[0, -1]
+                res = model(input_ids=torch.tensor([ids]), output_hidden_states=True)
+            logits = res.logits[0, -1]
             probs = softmax([float(logits[s]) for s in slots])
             err = max(abs(a - b) for a, b in zip(got["probabilities"], probs))
             entry = stored[seq]
-            ok = (got["prompt_sha256"] == digest and got["input_tokens"] == len(ids) and err < 1e-4
+            # the stored vector is the final-normalized hidden state at the last position, L2-normalized
+            import base64, struct
+            vec = struct.unpack("<%df" % entry["vector"]["dim"], base64.b64decode(entry["vector"]["f32le_b64"]))
+            ref = res.hidden_states[-1][0, -1].double()
+            ref = (ref / ref.norm()).tolist()
+            verr = max(abs(a - b) for a, b in zip(vec, ref))
+            ok_meta = entry.get("meta") == {"session": "parity", "mode": mode} and len(vec) == len(ref)
+            ok = (got["prompt_sha256"] == digest and got["input_tokens"] == len(ids) and err < 1e-4 and verr < 1e-4
                   and got["prompt_version"] == "direct-options-memory-v1" and got["memory"]["recalled"] == len(recalled)
-                  and entry["id"] == got["id"] and entry["prompt_sha256"] == digest)
+                  and entry["id"] == got["id"] and entry["prompt_sha256"] == digest and ok_meta)
             print(f"  memory {label:6s} {mode:6s} {got['id']:12s} recalled={len(recalled)} "
-                  f"sha256={'match' if got['prompt_sha256'] == digest else 'DIFF'} max|dp|={err:.1e} {'ok' if ok else 'FAIL'}")
+                  f"sha256={'match' if got['prompt_sha256'] == digest else 'DIFF'} max|dp|={err:.1e} "
+                  f"max|dvector|={verr:.1e} {'ok' if ok else 'FAIL'}")
             if not ok:
                 failures.append(f"memory score {mode} {got['id']}")
     want = memory_reference.roots(mem.read_bytes().split(b"\n")[:-1])
