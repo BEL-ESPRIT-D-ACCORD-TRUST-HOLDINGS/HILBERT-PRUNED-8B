@@ -298,16 +298,25 @@ How it is built:
 - a 3-stage `cp.async.cg` pipeline tracked by `mbarrier`;
 - warp-shuffle reductions.
 
-ptxas reports 128 registers, no spills and no stack, which allows 2 blocks
-of 256 threads per SM.
+Each matrix multiply runs one of two ways. The host picks automatically:
+
+- **Data-parallel:** one 128×128 output tile per block.
+- **Stream-K:** for shapes that leave a wave of blocks underfilled, as small
+  EP batches do. The K-loop work of all tiles is split evenly over every
+  resident block. A block that starts inside a tile hands its partial sum to
+  the tile's owner through a 64 KB workspace slot and an epoch flag.
+
+Both kernels use 128 registers with no spills and no stack (ptxas), which
+allows 2 blocks of 256 threads per SM. Stream-K needs every block resident
+at once, so don't run other kernels on the GPU concurrently.
 
 ```bash
 make ep CUDA_HOME=/usr/local/cuda && build/ep-sm86
 ```
 
-The self-test compares each kernel path with a host reference built from the
-same bf16 inputs. It then runs a full EP step and times a 4096^3 relaxation
-matrix multiply against the GA10x BF16 peak. Shapes must be multiples of 128
+The self-test compares each kernel path, in both modes, with a host
+reference built from the same bf16 inputs. It then runs a full EP step and
+times data-parallel against Stream-K on EP-sized and large shapes. Shapes must be multiples of 128
 (M, N) and 32 (K).
 
 ## Testing

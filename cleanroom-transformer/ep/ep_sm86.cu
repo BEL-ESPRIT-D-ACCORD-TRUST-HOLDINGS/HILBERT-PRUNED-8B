@@ -175,85 +175,71 @@ __device__ __forceinline__ void frag_b(uint32_t (&b)[NT][2], uint32_t base, int 
 }
 
 // ======================================================================================================
-// ep_gemm_kernel
+// Shared mainloop and epilogue
 // ------------------------------------------------------------------------------------------------------
-//  Registers / thread : 128 (ptxas, CUDA 12.8), 0 B stack, 0 spills; cap from __launch_bounds__(256, 2) =
-//                       65536 / (2 x 256). 64 f32 accumulators + 16 A + 8 B fragment registers + addressing.
-//                       `make ep` prints ptxas' report.
-//  Shared / block     : 49152 B dynamic (3 stages x (8 KB A + 8 KB B)) + 128 B static (3 mbarriers).
-//  Occupancy          : 2 blocks x 256 threads = 512 threads = 16 warps / SM (4 per SMSP), 33% of 48.
-//                       Limited jointly by registers (2 x 256 x 128 = 65536) and shared memory
-//                       (2 x (49152 + 128 + 1024 reserved) = 100608 B of 102400; needs the max-shared carveout). 100% (48 warps) would need
-//                       <= 40 registers/thread, which cannot hold the 64-float accumulator tile; latency is
-//                       hidden by 16 independent MMAs per warp per k16 and the 3-deep cp.async ring instead.
-//                       Grid = (N/128, M/128); one wave = 2 x #SMs blocks (136 on an RTX 3080).
-//  Throughput limit   : 2*128*128*32 FLOP per 16 KB tile pair = 64 FLOP/B at the tile. Compute-bound for
-//                       M, N, K >= ~1024 (L2 reuse across blocks raises effective intensity above the
-//                       ~78 FLOP/B DRAM ridge of a 3080: 59.5 TFLOPS BF16/FP32-acc vs 760 GB/s).
-//                       Typical EP batches (M = 128..256) give < 1 wave and are latency-bound.
-// ======================================================================================================
-__global__ void __launch_bounds__(THREADS, 2)
-ep_gemm_kernel(Segment s0, Segment s1, int nseg, Epilogue ep) {
-    extern __shared__ __align__(128) unsigned char smem[];
-    __shared__ __align__(8) uint64_t full[STAGES];
-    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
-    const int wm0 = (warp >> 2) * WM, wn0 = (warp & 3) * WN;
-    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
-    const uint32_t sbase = smem_u32(smem), bar0 = smem_u32(&full[0]);
-    const int T = s0.ktiles + (nseg > 1 ? s1.ktiles : 0);
+// K tiles are numbered over the concatenated segments. `seq` counts k-tiles this block has consumed so far,
+// so stage = seq % STAGES and mbarrier phase parity = (seq / STAGES) & 1 stay consistent across the several
+// tile ranges a Stream-K block processes.
+struct Ctx {
+    uint32_t sbase, bar0;
+    int tid, lane, wm0, wn0;
+};
 
-    if (tid == 0) {
-#pragma unroll
-        for (int s = 0; s < STAGES; s++) mbar_init(bar0 + 8 * s, THREADS);
-    }
-    __syncthreads();
-
-    // Segment fields are selected as scalars (uniform selects): binding a reference to a __grid_constant__
-    // parameter struct would force a local-memory copy (an 80 B stack frame in an earlier revision).
-    auto issue = [&](int t) {  // tile t of the concatenated K range into stage t % STAGES
-        const bool second = t >= s0.ktiles;
-        const int kt = second ? t - s0.ktiles : t;
-        const uint32_t st = sbase + (t % STAGES) * STAGE_BYTES;
-        load_tile(st, second ? s1.A : s0.A, second ? s1.lda : s0.lda, second ? s1.a_layout : s0.a_layout, m0, kt * BK,
-                  tid);
-        load_tile(st + TILE_BYTES, second ? s1.B : s0.B, second ? s1.ldb : s0.ldb, second ? s1.b_layout : s0.b_layout,
-                  n0, kt * BK, tid);
-        mbar_arrive_cp_async(bar0 + 8 * (t % STAGES));
-    };
-
-    float acc[MT][NT][4];
+__device__ __forceinline__ void zero(float (&acc)[MT][NT][4]) {
 #pragma unroll
     for (int i = 0; i < MT; i++)
 #pragma unroll
         for (int j = 0; j < NT; j++)
 #pragma unroll
             for (int e = 0; e < 4; e++) acc[i][j][e] = 0.f;
+}
 
-#pragma unroll
-    for (int t = 0; t < STAGES - 1; t++)
-        if (t < T) issue(t);
-
-    for (int t = 0; t < T; t++) {
-        mbar_wait(bar0 + 8 * (t % STAGES), (t / STAGES) & 1);  // tile t landed (all 256 threads' copies)
-        __syncthreads();                                        // everyone finished reading tile t-1
-        if (t + STAGES - 1 < T) issue(t + STAGES - 1);          // refill the stage tile t-1 used
+// acc += sum over k-tiles [kb, ke) of the output tile at (m0, n0).
+__device__ __forceinline__ void mainloop(const Segment &s0, const Segment &s1, const Ctx &x, int m0, int n0, int kb,
+                                         int ke, uint32_t &seq, float (&acc)[MT][NT][4]) {
+    const int n = ke - kb;
+    // Segment fields are selected as scalars (uniform selects): binding a reference to one of two
+    // __grid_constant__ parameter structs would force a local-memory copy.
+    auto issue = [&](int t, uint32_t q) {  // k-tile t into stage q % STAGES
         const bool second = t >= s0.ktiles;
+        const int kt = second ? t - s0.ktiles : t;
+        const uint32_t st = x.sbase + (q % STAGES) * STAGE_BYTES;
+        load_tile(st, second ? s1.A : s0.A, second ? s1.lda : s0.lda, second ? s1.a_layout : s0.a_layout, m0, kt * BK,
+                  x.tid);
+        load_tile(st + TILE_BYTES, second ? s1.B : s0.B, second ? s1.ldb : s0.ldb, second ? s1.b_layout : s0.b_layout,
+                  n0, kt * BK, x.tid);
+        mbar_arrive_cp_async(x.bar0 + 8 * (q % STAGES));
+    };
+#pragma unroll
+    for (int i = 0; i < STAGES - 1; i++)
+        if (i < n) issue(kb + i, seq + i);
+    for (int i = 0; i < n; i++) {
+        const uint32_t q = seq + i;
+        mbar_wait(x.bar0 + 8 * (q % STAGES), (q / STAGES) & 1);  // k-tile landed (all 256 threads' copies)
+        __syncthreads();                                          // everyone finished reading k-tile i-1
+        if (i + STAGES - 1 < n) issue(kb + i + STAGES - 1, q + STAGES - 1);  // refill the stage i-1 used
+        const bool second = kb + i >= s0.ktiles;
         const int a_layout = second ? s1.a_layout : s0.a_layout, b_layout = second ? s1.b_layout : s0.b_layout;
         const int negate = second ? s1.negate_a : s0.negate_a;
-        const uint32_t st = sbase + (t % STAGES) * STAGE_BYTES;
+        const uint32_t st = x.sbase + (q % STAGES) * STAGE_BYTES;
 #pragma unroll
         for (int kk = 0; kk < BK; kk += 16) {
             uint32_t a[MT][4], b[NT][2];
-            frag_a(a, st, a_layout, wm0, kk, lane, negate);
-            frag_b(b, st + TILE_BYTES, b_layout, wn0, kk, lane);
+            frag_a(a, st, a_layout, x.wm0, kk, x.lane, negate);
+            frag_b(b, st + TILE_BYTES, b_layout, x.wn0, kk, x.lane);
 #pragma unroll
-            for (int i = 0; i < MT; i++)
+            for (int i2 = 0; i2 < MT; i2++)
 #pragma unroll
-                for (int j = 0; j < NT; j++) mma_bf16(acc[i][j], a[i], b[j][0], b[j][1]);
+                for (int j = 0; j < NT; j++) mma_bf16(acc[i2][j], a[i2], b[j][0], b[j][1]);
         }
     }
+    seq += n;
+    __syncthreads();  // every stage is free before the next range's prologue refills it
+}
 
-    // Fused epilogue. Accumulator c[0..1] = (row lane/4, cols 2*(lane%4)+{0,1}), c[2..3] = row + 8.
+// Fused epilogue. Accumulator c[0..1] = (row lane/4, cols 2*(lane%4)+{0,1}), c[2..3] = row + 8.
+__device__ __forceinline__ void epilogue(const Epilogue &ep, const Ctx &x, int m0, int n0,
+                                         const float (&acc)[MT][NT][4]) {
     float dsum = 0.f;
 #pragma unroll
     for (int i = 0; i < MT; i++)
@@ -261,8 +247,8 @@ ep_gemm_kernel(Segment s0, Segment s1, int nseg, Epilogue ep) {
         for (int j = 0; j < NT; j++)
 #pragma unroll
             for (int h = 0; h < 2; h++) {
-                const int r = m0 + wm0 + i * 16 + (lane >> 2) + h * 8;
-                const int c = n0 + wn0 + j * 8 + (lane & 3) * 2;
+                const int r = m0 + x.wm0 + i * 16 + (x.lane >> 2) + h * 8;
+                const int c = n0 + x.wn0 + j * 8 + (x.lane & 3) * 2;
                 const float v0 = acc[i][j][2 * h], v1 = acc[i][j][2 * h + 1];
                 const size_t o = (size_t)r * ep.ldc + c;
                 if (ep.kind == 0) {  // kernel-uniform branch
@@ -290,7 +276,123 @@ ep_gemm_kernel(Segment s0, Segment s1, int nseg, Epilogue ep) {
     if (ep.kind == 0) {  // warp tree reduction in registers, one atomic per warp
 #pragma unroll
         for (int d = 16; d > 0; d >>= 1) dsum += __shfl_down_sync(0xffffffffu, dsum, d);
-        if (lane == 0) atomicAdd(ep.delta, dsum);
+        if (x.lane == 0) atomicAdd(ep.delta, dsum);
+    }
+}
+
+__device__ __forceinline__ Ctx setup(unsigned char *smem, uint64_t *full) {
+    Ctx x;
+    x.tid = threadIdx.x, x.lane = x.tid & 31;
+    const int warp = x.tid >> 5;
+    x.wm0 = (warp >> 2) * WM, x.wn0 = (warp & 3) * WN;
+    x.sbase = smem_u32(smem), x.bar0 = smem_u32(full);
+    if (x.tid == 0) {
+#pragma unroll
+        for (int s = 0; s < STAGES; s++) mbar_init(x.bar0 + 8 * s, THREADS);
+    }
+    __syncthreads();
+    return x;
+}
+
+// ======================================================================================================
+// ep_gemm_kernel (data-parallel: one 128x128 output tile per block)
+// ------------------------------------------------------------------------------------------------------
+//  Registers / thread : 128 (ptxas, CUDA 12.8), 0 B stack, 0 spills; cap from __launch_bounds__(256, 2) =
+//                       65536 / (2 x 256). 64 f32 accumulators + 16 A + 8 B fragment registers + addressing.
+//                       `make ep` prints ptxas' report.
+//  Shared / block     : 49152 B dynamic (3 stages x (8 KB A + 8 KB B)) + 128 B static (3 mbarriers).
+//  Occupancy          : 2 blocks x 256 threads = 512 threads = 16 warps / SM (4 per SMSP), 33% of 48.
+//                       Limited jointly by registers (2 x 256 x 128 = 65536) and shared memory
+//                       (2 x (49152 + 128 + 1024 reserved) = 100608 B of 102400; needs the max-shared
+//                       carveout). 100% (48 warps) would need <= 40 registers/thread, which cannot hold the
+//                       64-float accumulator tile; latency is hidden by 16 independent MMAs per warp per
+//                       k16 and the 3-deep cp.async ring instead.
+//                       Grid = (N/128, M/128); one wave = 2 x #SMs blocks (136 on an RTX 3080).
+//  Throughput limit   : 2*128*128*32 FLOP per 16 KB tile pair = 64 FLOP/B at the tile. Compute-bound for
+//                       M, N, K >= ~1024 (L2 reuse across blocks raises effective intensity above the
+//                       ~78 FLOP/B DRAM ridge of a 3080: 59.5 TFLOPS BF16/FP32-acc vs 760 GB/s).
+//                       With fewer tiles than one wave the idle SMs cap throughput: see the Stream-K kernel.
+// ======================================================================================================
+__global__ void __launch_bounds__(THREADS, 2)
+ep_gemm_kernel(Segment s0, Segment s1, int nseg, Epilogue ep) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    __shared__ __align__(8) uint64_t full[STAGES];
+    const Ctx x = setup(smem, full);
+    const int m0 = blockIdx.y * BM, n0 = blockIdx.x * BN;
+    float acc[MT][NT][4];
+    zero(acc);
+    uint32_t seq = 0;
+    mainloop(s0, s1, x, m0, n0, 0, s0.ktiles + (nseg > 1 ? s1.ktiles : 0), seq, acc);
+    epilogue(ep, x, m0, n0, acc);
+}
+
+// ======================================================================================================
+// ep_gemm_streamk_kernel (Stream-K: the K-loop work of all tiles split evenly over every resident block)
+// ------------------------------------------------------------------------------------------------------
+//  Work             : W = tiles x kiters MAC-iterations (one iteration = one 128x128x32 k-tile). Block b of
+//                     G owns iterations [b W / G, (b+1) W / G), walking tiles in order. A block that starts
+//                     inside a tile writes that partial tile to its workspace slot and raises its flag; the
+//                     block holding the tile's first iteration (the owner) adds every later partial, then
+//                     runs the epilogue once. Each block has at most one non-owner range (its first), so the
+//                     workspace is G x 64 KB and there is no atomic accumulation into the output.
+//  Grid             : G = resident blocks (2 x #SMs = 136 on a 3080) capped at W. Every block is resident
+//                     at once, so an owner spinning on a later block's flag cannot deadlock. Flags carry a
+//                     launch epoch and never need clearing.
+//  Registers / smem : same mainloop and epilogue as ep_gemm_kernel; ptxas' report comes from `make ep`.
+//  Why              : EP batches give few tiles (e.g. M=256, N=512: 8 tiles on 68 SMs, 6% of one wave).
+//                     Stream-K keeps all SMs on MMA work for any tile count; the cost is one 64 KB partial
+//                     store + load per split tile. The host chooses it when tiles leave a wave underfilled.
+//  Bound            : as ep_gemm_kernel per iteration; partial traffic adds ~2 x 64 KB per split.
+// ======================================================================================================
+__global__ void __launch_bounds__(THREADS, 2)
+ep_gemm_streamk_kernel(Segment s0, Segment s1, int nseg, Epilogue ep, int tiles_n, int kiters, int work,
+                       float *__restrict__ partials, int *__restrict__ flags, int epoch) {
+    extern __shared__ __align__(128) unsigned char smem[];
+    __shared__ __align__(8) uint64_t full[STAGES];
+    const Ctx x = setup(smem, full);
+    const int G = gridDim.x, b = blockIdx.x;
+    // 32-bit iteration counters (host guarantees work < 2^31); 64-bit only inside the products
+    const int begin = (int)((long long)work * b / G), end = (int)((long long)work * (b + 1) / G);
+    uint32_t seq = 0;
+    for (int it = begin; it < end;) {
+        const int tile = it / kiters, kb = it - tile * kiters;
+        const int ke = min(kiters, end - tile * kiters);
+        const int m0 = (tile / tiles_n) * BM, n0 = (tile % tiles_n) * BN;
+        float acc[MT][NT][4];
+        zero(acc);
+        mainloop(s0, s1, x, m0, n0, kb, ke, seq, acc);
+        float *slot = partials + (size_t)b * (BM * BN);
+        if (kb != 0) {  // not the tile's owner: hand the partial sum over (only ever this block's first range)
+#pragma unroll
+            for (int i = 0; i < MT; i++)
+#pragma unroll
+                for (int j = 0; j < NT; j++)
+#pragma unroll
+                    for (int e = 0; e < 4; e++) __stcg(slot + ((i * NT + j) * 4 + e) * THREADS + x.tid, acc[i][j][e]);
+            __threadfence();
+            __syncthreads();
+            if (x.tid == 0) atomicExch(flags + b, epoch);
+        } else {
+            // owner: add the partials of the blocks that start inside this tile, in block order
+            const int tile_end = (tile + 1) * kiters;
+            for (int p = b + 1; p < G && (int)((long long)work * p / G) < tile_end; p++) {
+                if (x.tid == 0) {  // acquire: observe the flag, fence, then release the block through the barrier
+                    while (atomicAdd(flags + p, 0) != epoch) __nanosleep(64);
+                    __threadfence();
+                }
+                __syncthreads();
+                const float *src = partials + (size_t)p * (BM * BN);
+#pragma unroll
+                for (int i = 0; i < MT; i++)
+#pragma unroll
+                    for (int j = 0; j < NT; j++)
+#pragma unroll
+                        for (int e = 0; e < 4; e++)
+                            acc[i][j][e] += __ldcg(src + ((i * NT + j) * 4 + e) * THREADS + x.tid);
+            }
+            epilogue(ep, x, m0, n0, acc);
+        }
+        it = tile * kiters + ke;
     }
 }
 
@@ -314,21 +416,56 @@ static int check_shape(int M, int N, int K, const char *what) {
     return 0;
 }
 
+// 0 = choose by shape, 1 = always data-parallel, 2 = always Stream-K (tests and benchmarks)
+static int g_mode = 0;
+static int g_resident = 0;  // blocks of 256 resident at once on the whole GPU
+static float *g_partials = NULL;
+static int *g_flags = NULL, g_epoch = 0;
+
 static int launch_ready(void) {
-    static bool attr = false;
-    if (!attr) {
-        CK(cudaFuncSetAttribute(ep_gemm_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
-        // 2 x (48 KB + 24 B + 1 KB reserved) needs the full 100 KB shared carveout for 2 blocks/SM
-        CK(cudaFuncSetAttribute(ep_gemm_kernel, cudaFuncAttributePreferredSharedMemoryCarveout,
+    if (g_resident) return 0;
+    const void *fns[] = {(const void *)ep_gemm_kernel, (const void *)ep_gemm_streamk_kernel};
+    for (int f = 0; f < 2; f++) {
+        CK(cudaFuncSetAttribute(fns[f], cudaFuncAttributeMaxDynamicSharedMemorySize, SMEM_BYTES));
+        // 2 x (48 KB + 128 B + 1 KB reserved) needs the full 100 KB shared carveout for 2 blocks/SM
+        CK(cudaFuncSetAttribute(fns[f], cudaFuncAttributePreferredSharedMemoryCarveout,
                                 cudaSharedmemCarveoutMaxShared));
-        attr = true;
     }
+    int dev, sms, per_sm;
+    CK(cudaGetDevice(&dev));
+    CK(cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, dev));
+    CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&per_sm, ep_gemm_streamk_kernel, THREADS, SMEM_BYTES));
+    if (per_sm < 1) {
+        fprintf(stderr, "ep: kernel does not fit on this GPU\n");
+        return -1;
+    }
+    g_resident = per_sm * sms;
+    CK(cudaMalloc(&g_partials, (size_t)g_resident * BM * BN * sizeof(float)));
+    CK(cudaMalloc(&g_flags, (size_t)g_resident * sizeof(int)));
+    CK(cudaMemset(g_flags, 0, (size_t)g_resident * sizeof(int)));
     return 0;
 }
 
 static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &ep, int M, int N, cudaStream_t st) {
     if (launch_ready()) return -1;
-    ep_gemm_kernel<<<dim3(N / BN, M / BM), THREADS, SMEM_BYTES, st>>>(a, b, nseg, ep);
+    const int tiles_n = N / BN, tiles = (M / BM) * tiles_n;
+    const int kiters = a.ktiles + (nseg > 1 ? b.ktiles : 0);
+    // Data-parallel when the last wave is at least 3/4 full or there are many waves; Stream-K otherwise.
+    const int waves = (tiles + g_resident - 1) / g_resident, tail = tiles - (waves - 1) * g_resident;
+    const bool streamk = g_mode == 2 || (g_mode == 0 && waves < 4 && 4 * tail < 3 * g_resident);
+    if (!streamk) {
+        ep_gemm_kernel<<<dim3(tiles_n, M / BM), THREADS, SMEM_BYTES, st>>>(a, b, nseg, ep);
+    } else {
+        const long long work = (long long)tiles * kiters;
+        if (work >= (1ll << 31)) {
+            fprintf(stderr, "ep: %lld k-tile iterations exceed the Stream-K 32-bit range\n", work);
+            return -1;
+        }
+        const int G = (int)(work < g_resident ? work : g_resident);
+        g_epoch = g_epoch == 0x7fffffff ? 1 : g_epoch + 1;
+        ep_gemm_streamk_kernel<<<G, THREADS, SMEM_BYTES, st>>>(a, b, nseg, ep, tiles_n, kiters, (int)work, g_partials,
+                                                               g_flags, g_epoch);
+    }
     CK(cudaGetLastError());
     return 0;
 }
@@ -552,39 +689,57 @@ static int demo_step(void) {
     return 0;
 }
 
+// Times ep_relax (no feedback) as data-parallel and as Stream-K on the same inputs.
 static int bench(void) {
     cudaDeviceProp p;
     CK(cudaGetDeviceProperties(&p, 0));
     int khz = 0;
     CK(cudaDeviceGetAttribute(&khz, cudaDevAttrClockRate, 0));
-    const int M = 4096, N = 4096, K = 4096, reps = 20;
-    Buf A, B, old;
-    if (buf(A, (size_t)M * K, 0, 1) || buf(B, (size_t)N * K, -0.02f, 0.02f) || buf(old, (size_t)M * N, 0, 1)) return -1;
-    float *bias, *delta;
-    bf16 *out;
-    CK(cudaMalloc(&bias, N * 4));
-    CK(cudaMemset(bias, 0, N * 4));
-    CK(cudaMalloc(&delta, 4));
-    CK(cudaMalloc(&out, (size_t)M * N * 2));
+    // GA10x: 4 Tensor Cores/SM x 64 BF16 FMA/clk with FP32 accumulate = 256 FMA/clk/SM (GA102 whitepaper)
+    const double peak = 2.0 * 256 * p.multiProcessorCount * (khz * 1e3) / 1e12;
+    if (launch_ready()) return -1;
+    printf("  timing (%s, %d resident blocks, peak %.1f TFLOPS at the boost clock):\n", p.name, g_resident, peak);
+    const int shapes[][3] = {{256, 512, 512}, {256, 2048, 2048}, {512, 1024, 4096}, {1024, 4096, 1024},
+                             {4096, 4096, 4096}};
     cudaEvent_t e0, e1;
     CK(cudaEventCreate(&e0));
     CK(cudaEventCreate(&e1));
-    if (ep_relax(A.d, K, B.d, NULL, 0, NULL, bias, old.d, NULL, 0, out, M, N, delta, 0)) return -1;  // warm-up
-    CK(cudaEventRecord(e0));
-    for (int r = 0; r < reps; r++)
-        if (ep_relax(A.d, K, B.d, NULL, 0, NULL, bias, old.d, NULL, 0, out, M, N, delta, 0)) return -1;
-    CK(cudaEventRecord(e1));
-    CK(cudaEventSynchronize(e1));
-    float ms;
-    CK(cudaEventElapsedTime(&ms, e0, e1));
-    const double tflops = 2.0 * M * N * K * reps / (ms * 1e-3) / 1e12;
-    // GA10x: 4 Tensor Cores/SM x 64 BF16 FMA/clk with FP32 accumulate = 256 FMA/clk/SM (GA102 whitepaper)
-    const double peak = 2.0 * 256 * p.multiProcessorCount * (khz * 1e3) / 1e12;
+    for (size_t si = 0; si < sizeof shapes / sizeof *shapes; si++) {
+        const int M = shapes[si][0], N = shapes[si][1], K = shapes[si][2];
+        const int reps = M * (long long)N * K > (1ll << 34) ? 10 : 200;
+        Buf A, B, old;
+        if (buf(A, (size_t)M * K, 0, 1) || buf(B, (size_t)N * K, -0.02f, 0.02f) || buf(old, (size_t)M * N, 0, 1))
+            return -1;
+        float *bias, *delta;
+        bf16 *out;
+        CK(cudaMalloc(&bias, N * 4));
+        CK(cudaMemset(bias, 0, N * 4));
+        CK(cudaMalloc(&delta, 4));
+        CK(cudaMalloc(&out, (size_t)M * N * 2));
+        double t[3] = {0, 0, 0};
+        for (int mode = 1; mode <= 2; mode++) {
+            g_mode = mode;
+            if (ep_relax(A.d, K, B.d, NULL, 0, NULL, bias, old.d, NULL, 0, out, M, N, delta, 0)) return -1;  // warm-up
+            CK(cudaEventRecord(e0));
+            for (int r = 0; r < reps; r++)
+                if (ep_relax(A.d, K, B.d, NULL, 0, NULL, bias, old.d, NULL, 0, out, M, N, delta, 0)) return -1;
+            CK(cudaEventRecord(e1));
+            CK(cudaEventSynchronize(e1));
+            float ms;
+            CK(cudaEventElapsedTime(&ms, e0, e1));
+            t[mode] = ms / reps;
+        }
+        g_mode = 0;
+        const double flop = 2.0 * M * N * K;
+        const int tiles = (M / BM) * (N / BN);
+        printf("    %5d x %5d x %5d  %4d tiles  data-parallel %8.4f ms %5.1f TFLOPS | Stream-K %8.4f ms %5.1f TFLOPS"
+               "  (%.2fx)\n",
+               M, N, K, tiles, t[1], flop / t[1] / 1e9, t[2], flop / t[2] / 1e9, t[1] / t[2]);
+        cudaFree(A.d), cudaFree(B.d), cudaFree(old.d), cudaFree(bias), cudaFree(delta), cudaFree(out);
+        free(A.h), free(B.h), free(old.h);
+    }
     int blocks = 0;
-    if (launch_ready()) return -1;
     CK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(&blocks, ep_gemm_kernel, THREADS, SMEM_BYTES));
-    printf("  timing: relax GEMM %dx%dx%d on %s: %.3f ms, %.1f TFLOPS (%.0f%% of %.1f TFLOPS at the boost clock)\n", M,
-           N, K, p.name, ms / reps, tflops, 100 * tflops / peak, peak);
     printf("  occupancy: %d blocks x %d threads per SM (%d of %d warps)\n", blocks, THREADS, blocks * THREADS / 32,
            p.maxThreadsPerMultiProcessor / 32);
     return 0;
@@ -597,11 +752,18 @@ int main(int argc, char **argv) {
         return 2;
     }
     printf("%s, sm_%d%d, %d SMs\n", p.name, p.major, p.minor, p.multiProcessorCount);
-    printf("kernel paths vs host reference (same bf16 operands):\n");
-    if (test_relax(128, 128, 32, 0, false) || test_relax(256, 384, 512, 0, false) ||
-        test_relax(256, 256, 256, 128, false) || test_relax(128, 128, 256, 0, true) || test_update(128, 256, 128) ||
-        test_update(384, 256, 512) || demo_step() || bench())
-        return 1;
+    static const char *names[] = {"", "data-parallel", "Stream-K"};
+    for (int mode = 1; mode <= 2; mode++) {  // every path, both decompositions
+        g_mode = mode;
+        printf("%s kernel vs host reference (same bf16 operands):\n", names[mode]);
+        if (test_relax(128, 128, 32, 0, false) || test_relax(256, 384, 512, 0, false) ||
+            test_relax(256, 256, 256, 128, false) || test_relax(128, 128, 256, 0, true) ||
+            test_relax(512, 256, 4096, 0, false) || test_update(128, 256, 128) || test_update(384, 256, 512))
+            return 1;
+    }
+    g_mode = 0;
+    printf("automatic choice:\n");
+    if (demo_step() || bench()) return 1;
     if (failures) {
         printf("%d check(s) FAILED\n", failures);
         return 1;
