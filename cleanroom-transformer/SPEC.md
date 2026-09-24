@@ -322,6 +322,11 @@ One JSON object per line, in this key order: `seq`, `time_us`, `id`,
 - `seq` counts from 0 with no gaps. `time_us` (microseconds since the Unix
   epoch) increases strictly. If the clock goes back, the previous time plus 1
   is used.
+- **`--memory-clock START_US`.** Entry `seq` n gets `time_us = START_US + n`
+  instead of the wall clock (still raised to the previous time plus 1 if an
+  earlier entry is later). The same rows, model and options then give a
+  byte-identical file and the same roots. START_US must be above 0; the flag
+  needs `--memory`.
 - `prev` is the previous line's `entry_hash` in hex (64 zero bytes for the
   first line).
 - Every open re-verifies the whole chain. An edited, deleted, reordered or

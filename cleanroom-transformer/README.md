@@ -207,6 +207,11 @@ build/oqs/cleanroom-transformer memory-verify --proof sig.json --root ROOT --pub
   - `--memory-vectors yes` stores the final hidden state that each answer was
     read from, L2-normalized. It matches PyTorch within 4e-7 in `parity.py`.
   - `memory-similar` finds the past decisions whose vectors are closest.
+- **Reproducible files.** `--memory-clock START_US` replaces the wall clock
+  with `START_US + seq`. Re-running the same rows then gives a
+  byte-identical memory file and root, whatever the thread count. Falcon
+  signatures stay randomized (a fresh nonce each time), but whether they
+  verify does not change.
 - **Signatures (optional).** Falcon-512 through
   [liboqs](https://github.com/open-quantum-safe/liboqs). One signature over
   the root covers the whole memory.
@@ -332,6 +337,19 @@ reference built from the same bf16 inputs. It then runs a full EP step and
 times data-parallel, Stream-K and split-K ×2 on EP-sized and large
 shapes. Shapes must be multiples of 128
 (M, N) and 32 (K).
+
+**Determinism.** No floating-point atomics remain. The convergence sum is
+written as one partial per output tile (or per chunk in split-K) and added
+in a fixed order by `ep_delta_finish_kernel`. The only atomic left reads an
+integer flag. With the mode fixed, repeated runs give identical bits. The
+self-test checks this: it runs a relax and update step twice in every mode
+and compares outputs, the sum and the weights byte for byte.
+
+- Stream-K splits the work by the number of resident blocks, so it depends
+  on the GPU's SM count. Call `ep_set_streamk_grid(G)` to use a fixed grid
+  on every GPU, or `ep_set_decomposition` to fix the mode.
+- Different modes add partial sums in a different order, so they agree only
+  to rounding.
 
 ## Testing
 
