@@ -84,6 +84,16 @@ void json_dump_double(sbuf_t *b, double x); /* Python float repr */
 void sha256(const void *data, size_t len, uint8_t out[32]);
 void sha256_hex(const void *data, size_t len, char out[65]);
 
+/* SHAKE256 (FIPS 202), any output length; the memory trees use 64-byte digests. */
+typedef struct {
+    uint64_t a[25];
+    size_t pos;
+} shake256_t;
+void shake256_init(shake256_t *s);
+void shake256_update(shake256_t *s, const void *data, size_t len);
+void shake256_final(shake256_t *s, uint8_t *out, size_t len);
+void shake256(const void *data, size_t len, uint8_t *out, size_t out_len);
+
 /* ----------------------------------------------------------------- unicode */
 enum { UC_L = 1, UC_M = 2, UC_N = 4 };
 unsigned uc_class(uint32_t cp);     /* bitmask of UC_L | UC_M | UC_N */
@@ -109,6 +119,7 @@ uint32_t tokenizer_vocab_size(const tokenizer_t *t);
 /* ------------------------------------------------------------------ prompt */
 #define MAX_OPTIONS 16
 #define PROMPT_VERSION "direct-options-v1"
+#define PROMPT_VERSION_MEMORY "direct-options-memory-v1"
 
 typedef struct {
     const jval *row;
@@ -116,6 +127,8 @@ typedef struct {
     size_t id_len;
     uint32_t n_options;
     const jval *options[MAX_OPTIONS];
+    const char *memory; /* optional JSON array of recalled decisions (prompt version PROMPT_VERSION_MEMORY) */
+    size_t memory_len;
 } decision_t;
 
 int decision_validate(const jval *row, decision_t *out);
@@ -140,6 +153,40 @@ typedef struct {
 int decision_encode(const tokenizer_t *t, const chat_format_t *fmt, const decision_t *d, size_t max_tokens,
                     encoded_t *out);
 void encoded_free(encoded_t *e);
+
+/* Checks rows against committed prediction records (tools: `verify-prompts`). Only records whose
+ * `mode` is absent or "fresh" are references. Each row must match exactly one such record by id, and
+ * the counts must be equal; malformed records and duplicates fail before any row is encoded. Then
+ * every row must reproduce the record's prompt_sha256, input_tokens and answer_token_ids (and
+ * option_ids, when recorded). Returns 0 only if every row matches. Up to 20 per-row diagnostics
+ * are appended to `diag` (may be NULL). */
+typedef struct {
+    size_t rows, matched, mismatched, encode_errors;
+} verify_report_t;
+int prompt_verify(const tokenizer_t *t, const chat_format_t *fmt, jval *const *rows, size_t n_rows,
+                  jval *const *records, size_t n_records, size_t max_tokens, sbuf_t *diag, verify_report_t *rep);
+
+/* ------------------------------------------------------------------ memory */
+/* Decision memory (SPEC.md 6): a hash-chained JSONL log of scored decisions, committed by a sparse
+ * Merkle tree keyed by row id and an indexed Merkle tree keyed by time. */
+typedef struct memory memory_t;
+/* Opens and verifies the whole chain. `writable` creates the file if needed and locks it. */
+int memory_open(const char *path, bool writable, memory_t **out);
+void memory_close(memory_t *m);
+size_t memory_count(const memory_t *m);
+/* Appends one scored decision (p = option probabilities) and syncs it to disk. */
+int memory_append(memory_t *m, const decision_t *d, const double *p, const char *prompt_sha256,
+                  const char *prompt_version, const char *revision, uint32_t recalled);
+/* The last n decisions, oldest first, as the prompt's memory array: [{"criterion", "answer"}]. */
+void memory_recall_json(const memory_t *m, uint32_t n, sbuf_t *out);
+void memory_recall_lines(const memory_t *m, const char *id, size_t id_len, size_t last, sbuf_t *out);
+void memory_root_json(const memory_t *m, sbuf_t *out);
+/* Proof that id's latest entry is E, or that id was never recorded. */
+int memory_prove_id(const memory_t *m, const char *id, size_t id_len, sbuf_t *out);
+/* Proof that nothing was recorded with from_us <= time_us <= to_us; fails if something was. */
+int memory_prove_gap(const memory_t *m, uint64_t from_us, uint64_t to_us, sbuf_t *out);
+/* Checks a proof on its own (and against expect_root, hex, when given). */
+int memory_verify_proof(const jval *proof, const char *expect_root, sbuf_t *summary);
 
 /* ------------------------------------------------------------- safetensors */
 typedef enum { DT_F32, DT_F16, DT_BF16, DT_GGML } dtype_t;
@@ -167,10 +214,7 @@ const st_tensor_t *st_find(const st_set_t *s, const char *name);
 void st_close(st_set_t *s);
 
 /* -------------------------------------------------------------------- gguf */
-enum {
-    GGML_F32 = 0, GGML_F16 = 1, GGML_Q4_0 = 2, GGML_Q4_1 = 3, GGML_Q5_0 = 6, GGML_Q5_1 = 7, GGML_Q8_0 = 8,
-    GGML_Q2_K = 10, GGML_Q3_K = 11, GGML_Q4_K = 12, GGML_Q5_K = 13, GGML_Q6_K = 14, GGML_BF16 = 30
-};
+/* GGML_* type ids and block sizes live in ggml_quant.h (shared with the CUDA kernels). */
 
 typedef struct gguf gguf_t;
 typedef struct {
@@ -235,6 +279,8 @@ typedef struct {
 
 /* Row r of W as float32, in Hugging Face order. */
 void wmat_row_f32(const wmat_t *w, uint32_t r, float *out);
+/* Storage row holding Hugging Face row r (differs only for llama.cpp's interleaved q/k rows). */
+uint32_t wmat_src_row(const wmat_t *w, uint32_t r);
 
 typedef struct {
     uint32_t type, slot; /* slot indexes the full or linear state arrays */
@@ -294,7 +340,9 @@ struct backend {
 
 backend_t *cpu_backend_create(const model_t *m, size_t max_seq);
 #ifdef USE_CUDA
-backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device);
+/* keep_quantized: GGUF quantized weights stay in their block format on the GPU
+ * (dequantized inside the kernels); otherwise every weight is uploaded as bf16. */
+backend_t *cuda_backend_create(const model_t *m, size_t max_seq, int device, bool keep_quantized);
 int cuda_selftest(const model_t *m, int device, size_t n_tokens, int verbose);
 #endif
 
@@ -306,6 +354,8 @@ typedef struct {
     size_t max_tokens;
     chat_format_t fmt;
     char revision[128];
+    memory_t *memory; /* optional: every scored decision is appended */
+    uint32_t recall;  /* > 0: the last `recall` decisions go into each prompt (PROMPT_VERSION_MEMORY) */
 } engine_t;
 
 /* Scores one row directly. Appends one JSON result line (no newline). */

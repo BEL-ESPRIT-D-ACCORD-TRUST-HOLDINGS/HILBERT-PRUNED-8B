@@ -26,7 +26,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | GGUF loading | Verified on the CPU. All 13 supported quant formats dequantize bit-exactly against llama.cpp's reference. Tiny Llama GGUFs match PyTorch (F32) and transformers' GGUF loader (quantized) within 1e-6 relative. A released Llama 3 8B Instruct Q4_K_M file's tokenizer and prompts match Hugging Face on every row tested. **Not yet run with a full 8B GGUF** |
 | Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
 | Shape contract | Proven with Alloy. Every matrix multiply in the real Qwen3.5-4B and Llama 3 8B forward passes is a valid siphon in `formal/FreehandTensorSiphon.als`, and the head-sharing, RoPE and conv-split rules hold in bounded proofs (see Formal checks) |
-| CUDA forward pass | Compiles for sm_86 with no warnings. **Not yet run on a GPU.** Run `selftest` (below) before relying on it |
+| CUDA forward pass | Compiles for sm_86 with no warnings or register spills. **Not yet run on a GPU.** Run `selftest` (below) before relying on it. It also checks every quantized-weight kernel against the host decoder, and the fused single-token kernels against a double-precision host reference and the unfused kernels |
 
 ## Build
 
@@ -121,11 +121,16 @@ build/cleanroom-transformer-cuda score --model Meta-Llama-3-8B-Instruct-Q4_K_M.g
 - **Memory:** weights stay quantized in the memory-mapped file.
   - The CPU backend dequantizes each row as it uses it, which is slow but
     needs almost no extra RAM.
-  - The CUDA backend dequantizes to BF16 while uploading, so the GPU holds
-    the full BF16 model. An 8B model needs about 17 GB whatever the file's
-    quantization. That fits a 24 GB RTX 3090.
+  - The CUDA backend keeps quantized weights in their GGUF block format on
+    the GPU and decodes them inside the kernels. An 8B Q4_K_M file needs
+    about 5 GB of weights, plus a bf16 scratch buffer the size of the
+    largest weight (about 120 MB) and the attention cache.
+  - `--gpu-weights bf16` restores the old behaviour: every weight is
+    dequantized to BF16 while uploading (about 17 GB for 8B).
 - **Numerics:** the engine computes with the dequantized weights, as
-  `transformers` does when it loads a GGUF. llama.cpp itself multiplies
+  `transformers` does when it loads a GGUF. On the GPU, short inputs (under
+  32 tokens) use the weights decoded in float32. Longer inputs round them to
+  BF16 for the tensor cores, as the BF16 upload does. llama.cpp itself multiplies
   quantized weights with quantized activations, so its outputs differ
   slightly.
 - A partial download of a GGUF (just its header) is enough for `tokenize`,
@@ -148,6 +153,56 @@ token count, a SHA-256 hash of the exact prompt, and the model revision.
 Probabilities are relative scores among the given options. They are not
 calibrated confidence.
 
+### Decision memory
+
+The engine can keep a memory of its decisions. The memory is a
+tamper-evident log, and you can prove what it contains or doesn't contain.
+The full format is in [SPEC.md section 6](SPEC.md).
+
+```bash
+# record every decision (prompts and results are unchanged)
+build/cleanroom-transformer score --model qwen35-4b --revision REV \
+  --input rows.jsonl --output out.jsonl --memory memory.jsonl
+
+# continuity: also put the last 5 decisions into each prompt
+build/cleanroom-transformer score ... --memory memory.jsonl --recall 5
+
+build/cleanroom-transformer memory-recall --memory memory.jsonl --last 10       # or --id ID
+build/cleanroom-transformer memory-root   --memory memory.jsonl                 # commitment roots
+build/cleanroom-transformer memory-prove  --memory memory.jsonl --id route-1 > proof.json
+build/cleanroom-transformer memory-prove  --memory memory.jsonl --from T1 --to T2 > gap.json
+build/cleanroom-transformer memory-verify --proof proof.json --root ROOT        # no memory file needed
+```
+
+- **Record.** `--memory FILE` appends each decision to a JSONL file. Each
+  entry holds the id, question, chosen answer, probabilities, prompt hash,
+  revision and time. Each entry also includes the hash of the one before it,
+  so an edited, deleted, reordered or truncated entry is detected the next
+  time the file is opened.
+- **Recall.** `--recall N` adds the last N decisions to each prompt, so the
+  model sees its recent history. This changes the prompt (version
+  `direct-options-memory-v1`), so these results are not comparable with the
+  published results. Without `--recall`, prompts are byte-identical to
+  before.
+- **Prove.** Two sparse Merkle trees commit to the memory, both built with
+  SHAKE256.
+  - One is keyed by row id. It proves that an id's latest decision is a given
+    entry, or that the id was never decided.
+  - One is keyed by time. It proves that nothing was recorded in a time
+    window.
+
+  Proofs are checked on their own against a published root.
+- **Zero knowledge (optional).** `zk/` has a Circom circuit that proves a run
+  of up to 8 consecutive entries exists, without revealing them:
+  ```bash
+  cd zk && npm install
+  node memory_zk_inputs.js --memory ../memory.jsonl --start 3 --size 5 --out input.json
+  sh check.sh ../memory.jsonl
+  ```
+  `check.sh` confirms that honest runs are accepted and eight kinds of
+  forgery are rejected. Proving needs a Groth16 setup with a powers-of-tau
+  file of at least 2^17 (for example the Hermez ceremony file).
+
 ## How it works
 
 1. **Validate** the row and build the exact prompt text used by the Python
@@ -167,23 +222,70 @@ calibrated confidence.
 | `src/tokenizer.c`, `src/unicode.c` | Tokenizer and Unicode normalization |
 | `src/safetensors.c`, `src/model.c` | Weight loading and model configuration |
 | `src/gguf.c` | GGUF reader and dequantizers |
+| `src/ggml_quant.h` | GGUF block decoding, shared by the CPU and GPU |
 | `src/cpu_backend.c` | Reference forward pass in float32 |
 | `src/cuda_backend.cu` | GPU forward pass and `selftest` |
 | `src/engine.c` | Scoring, including shared-context scoring |
+| `src/verify.c` | Prompt verification against committed prediction records |
+| `src/memory.c`, `src/shake256.c` | Decision memory: log, Merkle trees and proofs |
+| `zk/` | Zero-knowledge range proof over the memory (Circom) |
 | `src/http.c` | HTTP server |
 | `src/shapes.c` | Per-layer weight table, and the shape export for formal checks |
 | `formal/` | Alloy models of the shape contract |
+
+### GPU kernel fusion
+
+Two steps of the CUDA forward pass run as single kernels:
+
+- **Single-token feed-forward (`k_gateup_swiglu`).** When a forward call
+  has one token, one kernel computes the gate and up projections and SwiGLU
+  in a single pass over the activations. It writes the bf16 result straight
+  into a separate buffer. It keeps the per-lane order and float32
+  accumulation of the matrix-vector kernels it replaces, then rounds to bf16
+  exactly once, as before. Calls with more tokens (prefill) still use the
+  separate matrix multiplies.
+- **Final norm and readout (`k_norm_readout`).** The final RMSNorm, with the
+  same `norm_offset` and epsilon, is computed inside the readout kernel for
+  each requested token id. The normalized vector is never stored. It works
+  for any hidden size with bf16 weights and for quantized output heads.
+
+`selftest` compares both kernels with a double-precision host reference and
+with the unfused kernels. It also runs a one-token forward step against the
+CPU backend. No speed measurements have been taken, so no speed-up is
+claimed.
 
 ## Testing
 
 ```bash
 make test                                            # unit tests
-python tools/check_prompts.py --model qwen35-4b      # prompts vs committed results
+make check-prompts MODEL=qwen35-4b                   # prompts vs committed results (native)
 python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
   --llama-tokenizer llama3-8b-instruct/tokenizer.json         # vs PyTorch (needs torch, transformers)
 python tools/gguf_parity.py --llama-tokenizer llama3-8b-instruct/tokenizer.json \
   [--real-gguf Meta-Llama-3-8B-Instruct-Q4_K_M.gguf]          # GGUF (also needs: pip install gguf)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
+(cd zk && npm install && sh check.sh ../memory.jsonl)             # ZK circuit soundness
+```
+
+The memory tests compare the engine with an independent Python version of
+the same trees (`tests/memory_reference.py`). `parity.py` also checks
+`--recall` prompts and probabilities against PyTorch.
+
+`make check-prompts` runs `cleanroom-transformer verify-prompts` on each
+benchmark file and the predictions committed from the Python run on it. It
+needs only the tokenizer. Every input row must have exactly one committed
+reference record (a record whose `mode` is absent or `fresh`), and the
+counts must match. Each row must then reproduce the record's
+`prompt_sha256`, `input_tokens`, `answer_token_ids` and `option_ids`.
+Missing, duplicate or malformed records fail the check. So do rows that
+cannot be encoded. It replaced `tools/check_prompts.py`, whose `zip()` over
+the output lines never checked rows missing from the end of the output.
+To check a single file:
+
+```bash
+build/cleanroom-transformer verify-prompts --model qwen35-4b \
+  --input ../benchmarks/data/authored144.jsonl \
+  --expected ../results/raw/predictions/direct-authored144.jsonl
 ```
 
 ## Formal checks
