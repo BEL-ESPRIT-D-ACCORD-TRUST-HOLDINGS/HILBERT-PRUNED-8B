@@ -153,6 +153,56 @@ token count, a SHA-256 hash of the exact prompt, and the model revision.
 Probabilities are relative scores among the given options. They are not
 calibrated confidence.
 
+### Decision memory
+
+The engine can keep a memory of its decisions. The memory is a
+tamper-evident log, and you can prove what it contains or doesn't contain.
+The full format is in [SPEC.md section 6](SPEC.md).
+
+```bash
+# record every decision (prompts and results are unchanged)
+build/cleanroom-transformer score --model qwen35-4b --revision REV \
+  --input rows.jsonl --output out.jsonl --memory memory.jsonl
+
+# continuity: also put the last 5 decisions into each prompt
+build/cleanroom-transformer score ... --memory memory.jsonl --recall 5
+
+build/cleanroom-transformer memory-recall --memory memory.jsonl --last 10       # or --id ID
+build/cleanroom-transformer memory-root   --memory memory.jsonl                 # commitment roots
+build/cleanroom-transformer memory-prove  --memory memory.jsonl --id route-1 > proof.json
+build/cleanroom-transformer memory-prove  --memory memory.jsonl --from T1 --to T2 > gap.json
+build/cleanroom-transformer memory-verify --proof proof.json --root ROOT        # no memory file needed
+```
+
+- **Record.** `--memory FILE` appends each decision to a JSONL file. Each
+  entry holds the id, question, chosen answer, probabilities, prompt hash,
+  revision and time. Each entry also includes the hash of the one before it,
+  so an edited, deleted, reordered or truncated entry is detected the next
+  time the file is opened.
+- **Recall.** `--recall N` adds the last N decisions to each prompt, so the
+  model sees its recent history. This changes the prompt (version
+  `direct-options-memory-v1`), so these results are not comparable with the
+  published results. Without `--recall`, prompts are byte-identical to
+  before.
+- **Prove.** Two sparse Merkle trees commit to the memory, both built with
+  SHAKE256.
+  - One is keyed by row id. It proves that an id's latest decision is a given
+    entry, or that the id was never decided.
+  - One is keyed by time. It proves that nothing was recorded in a time
+    window.
+
+  Proofs are checked on their own against a published root.
+- **Zero knowledge (optional).** `zk/` has a Circom circuit that proves a run
+  of up to 8 consecutive entries exists, without revealing them:
+  ```bash
+  cd zk && npm install
+  node memory_zk_inputs.js --memory ../memory.jsonl --start 3 --size 5 --out input.json
+  sh check.sh ../memory.jsonl
+  ```
+  `check.sh` confirms that honest runs are accepted and eight kinds of
+  forgery are rejected. Proving needs a Groth16 setup with a powers-of-tau
+  file of at least 2^17 (for example the Hermez ceremony file).
+
 ## How it works
 
 1. **Validate** the row and build the exact prompt text used by the Python
@@ -177,6 +227,8 @@ calibrated confidence.
 | `src/cuda_backend.cu` | GPU forward pass and `selftest` |
 | `src/engine.c` | Scoring, including shared-context scoring |
 | `src/verify.c` | Prompt verification against committed prediction records |
+| `src/memory.c`, `src/shake256.c` | Decision memory: log, Merkle trees and proofs |
+| `zk/` | Zero-knowledge range proof over the memory (Circom) |
 | `src/http.c` | HTTP server |
 | `src/shapes.c` | Per-layer weight table, and the shape export for formal checks |
 | `formal/` | Alloy models of the shape contract |
@@ -212,7 +264,12 @@ python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
 python tools/gguf_parity.py --llama-tokenizer llama3-8b-instruct/tokenizer.json \
   [--real-gguf Meta-Llama-3-8B-Instruct-Q4_K_M.gguf]          # GGUF (also needs: pip install gguf)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
+(cd zk && npm install && sh check.sh ../memory.jsonl)             # ZK circuit soundness
 ```
+
+The memory tests compare the engine with an independent Python version of
+the same trees (`tests/memory_reference.py`). `parity.py` also checks
+`--recall` prompts and probabilities against PyTorch.
 
 `make check-prompts` runs `cleanroom-transformer verify-prompts` on each
 benchmark file and the predictions committed from the Python run on it. It

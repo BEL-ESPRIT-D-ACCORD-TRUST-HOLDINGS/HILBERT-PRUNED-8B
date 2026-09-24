@@ -25,14 +25,29 @@ static void usage(void) {
             "  shapes    print every matrix multiply and activation width as JSON (config only)\n"
             "  dequant   print a GGUF tensor as float32 rows            --tensor NAME\n"
             "\n"
+            "memory (no --model needed; see SPEC.md 6):\n"
+            "  memory-root    commitment roots of a memory file        --memory FILE\n"
+            "  memory-recall  stored decisions, oldest first            --memory FILE [--id ID] [--last N]\n"
+            "  memory-prove   proof for one id, or that a time window is empty\n"
+            "                                     --memory FILE (--id ID | --from US --to US)\n"
+            "  memory-verify  check a proof file on its own             --proof FILE [--root HEX]\n"
+            "\n"
             "--model is a Hugging Face folder or a .gguf file.\n"
             "\n"
             "common options: [--backend cpu|cuda] [--device N] [--max-tokens N]\n"
-            "                [--gpu-weights quantized|bf16]   GGUF weights on the GPU (default: quantized)\n");
+            "                [--gpu-weights quantized|bf16]   GGUF weights on the GPU (default: quantized)\n"
+            "score/serve:    [--memory FILE]  append every decision to a memory file\n"
+            "                [--recall N]     also put the last N decisions into each prompt\n"
+            "                                 (prompt version " PROMPT_VERSION_MEMORY "; needs --memory)\n");
 }
 
 typedef struct {
     const char *cmd, *model, *revision, *input, *output, *mode, *backend, *host, *tokens, *ids, *tensor, *expected;
+    const char *memory, *id, *proof, *root;
+    uint64_t from_us, to_us;
+    bool has_from, has_to;
+    size_t last;
+    uint32_t recall;
     int device, port;
     bool gpu_bf16, max_tokens_set;
     size_t max_tokens, max_body, split, n_selftest;
@@ -51,6 +66,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
     a->max_tokens = 4096;
     a->max_body = 8u << 20;
     a->n_selftest = 64;
+    a->last = SIZE_MAX;
     if (argc < 2) return -1;
     a->cmd = argv[1];
     for (int i = 2; i < argc; i++) {
@@ -62,6 +78,14 @@ static int parse_args(int argc, char **argv, args_t *a) {
         else if (!strcmp(k, "--input")) a->input = v;
         else if (!strcmp(k, "--output")) a->output = v;
         else if (!strcmp(k, "--expected")) a->expected = v;
+        else if (!strcmp(k, "--memory")) a->memory = v;
+        else if (!strcmp(k, "--id")) a->id = v;
+        else if (!strcmp(k, "--proof")) a->proof = v;
+        else if (!strcmp(k, "--root")) a->root = v;
+        else if (!strcmp(k, "--from")) a->from_us = strtoull(v, NULL, 10), a->has_from = true;
+        else if (!strcmp(k, "--to")) a->to_us = strtoull(v, NULL, 10), a->has_to = true;
+        else if (!strcmp(k, "--last")) a->last = strtoull(v, NULL, 10);
+        else if (!strcmp(k, "--recall")) a->recall = (uint32_t)strtoul(v, NULL, 10);
         else if (!strcmp(k, "--mode")) a->mode = v;
         else if (!strcmp(k, "--backend")) a->backend = v;
         else if (!strcmp(k, "--host")) a->host = v;
@@ -80,7 +104,7 @@ static int parse_args(int argc, char **argv, args_t *a) {
         }
         else return -1;
     }
-    if (!a->model || a->max_tokens < 1) return -1;
+    if ((!a->model && strncmp(a->cmd, "memory-", 7)) || a->max_tokens < 1) return -1;
     return 0;
 }
 
@@ -217,6 +241,37 @@ static int cmd_verify_prompts(const args_t *a) {
     return rc;
 }
 
+/* ------------------------------------------------------------------ memory commands */
+static int cmd_memory(const args_t *a) {
+    sbuf_t out = {0};
+    int rc = 0;
+    if (!strcmp(a->cmd, "memory-verify")) {
+        if (!a->proof) return set_error("memory-verify needs --proof");
+        char *text;
+        size_t len;
+        if (read_file(a->proof, &text, &len)) return -1;
+        arena_t ar;
+        arena_init(&ar, 1 << 16);
+        jval *p;
+        rc = json_parse(&ar, text, len, &p) || memory_verify_proof(p, a->root, &out);
+        arena_free(&ar);
+        free(text);
+    } else {
+        if (!a->memory) return set_error("%s needs --memory", a->cmd);
+        memory_t *m;
+        if (memory_open(a->memory, false, &m)) return -1;
+        if (!strcmp(a->cmd, "memory-root")) memory_root_json(m, &out);
+        else if (!strcmp(a->cmd, "memory-recall")) memory_recall_lines(m, a->id, a->id ? strlen(a->id) : 0, a->last, &out);
+        else if (a->id && !a->has_from && !a->has_to) rc = memory_prove_id(m, a->id, strlen(a->id), &out);
+        else if (!a->id && a->has_from && a->has_to) rc = memory_prove_gap(m, a->from_us, a->to_us, &out);
+        else rc = set_error("memory-prove needs either --id, or --from and --to");
+        memory_close(m);
+    }
+    if (!rc) fwrite(out.data ? out.data : "", 1, out.len, stdout);
+    sb_free(&out);
+    return rc;
+}
+
 /* --input: one JSON string per line -> one line of ids per input line */
 static int tokenize_lines(const tokenizer_t *t, const char *path) {
     arena_t ar;
@@ -300,6 +355,13 @@ static int cmd_logits(const args_t *a) {
     return rc;
 }
 
+static void close_engine(engine_t *e) {
+    if (e->memory) memory_close(e->memory);
+    e->be->destroy(e->be);
+    tokenizer_free(e->tok);
+    model_free(e->model);
+}
+
 static int open_engine(const args_t *a, engine_t *e, model_t *m) {
     memset(e, 0, sizeof *e);
     if (!a->revision || !a->revision[0])
@@ -318,14 +380,18 @@ static int open_engine(const args_t *a, engine_t *e, model_t *m) {
         model_free(m);
         return -1;
     }
+    e->recall = a->recall;
+    if (a->recall && !a->memory) {
+        close_engine(e);
+        return set_error("--recall needs --memory");
+    }
+    if (a->memory && memory_open(a->memory, true, &e->memory)) {
+        close_engine(e);
+        return -1;
+    }
     return 0;
 }
 
-static void close_engine(engine_t *e) {
-    e->be->destroy(e->be);
-    tokenizer_free(e->tok);
-    model_free(e->model);
-}
 
 static int cmd_score(const args_t *a) {
     if (!a->input || !a->output) return set_error("--input and --output are required");
@@ -452,6 +518,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(a.cmd, "selftest")) rc = cmd_selftest(&a);
     else if (!strcmp(a.cmd, "shapes")) rc = cmd_shapes(&a);
     else if (!strcmp(a.cmd, "dequant")) rc = cmd_dequant(&a);
+    else if (!strcmp(a.cmd, "memory-root") || !strcmp(a.cmd, "memory-recall") || !strcmp(a.cmd, "memory-prove") ||
+             !strcmp(a.cmd, "memory-verify"))
+        rc = cmd_memory(&a);
     else {
         usage();
         return 2;
