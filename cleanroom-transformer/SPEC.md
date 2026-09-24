@@ -274,3 +274,115 @@ RoPE pairing and the conv split must satisfy `formal/TransformerShapes.als`.
 
 `probabilities = softmax(option_logits)`, computed in double precision. They
 are conditional option scores and are not calibrated confidence.
+
+## 6. Decision memory
+
+Optional. With `--memory FILE`, `score` and `serve` append every scored
+decision to a memory file. The default behaviour (no `--memory`) and the
+`direct-options-v1` prompt are unchanged.
+
+### 6.1 Log
+
+One JSON object per line, in this key order: `seq`, `time_us`, `id`,
+`question`, `answer` (option id of the highest probability), `answer_text`
+(its description), `option_ids`, `probabilities`, `prompt_sha256`,
+`prompt_version`, `revision`, `recalled`, `prev`.
+
+- `entry_hash = SHAKE256(0x00 || line)[0:64]`, over the stored bytes without
+  the newline.
+- `seq` counts from 0 with no gaps. `time_us` (microseconds since the Unix
+  epoch) increases strictly. If the clock goes back, the previous time plus 1
+  is used.
+- `prev` is the previous line's `entry_hash` in hex (64 zero bytes for the
+  first line).
+- Every open re-verifies the whole chain. An edited, deleted, reordered or
+  truncated line is an error, and nothing more is appended.
+- A writer holds a POSIX lock on the file, so a second process cannot append.
+
+### 6.2 Commitments
+
+`leaf(d) = SHAKE256(0x00 || d)`, `node(l, r) = SHAKE256(0x01 || l || r)`
+(64 bytes each). The empty leaf is `empty[0] = leaf("EMPTY_LEAF_NODE")`, and
+`empty[h + 1] = node(empty[h], empty[h])`. Paths run from the most
+significant key bit down.
+
+- **Id tree.** Depth 256, key `SHAKE256(0x03 || id)[0:32]`. The leaf is the
+  `entry_hash` of the newest line for that id.
+- **Time tree** (an indexed Merkle tree). Depth 64, keyed by `time_us`.
+  - The genesis leaf has key 0 and data `"0:47454e45534953:" + next`.
+  - Each line adds a leaf with data `"{time_us}:{entry_hash hex}:{next}"`.
+  - `next` is the following line's `time_us`, or 2^64 - 1 for the last line.
+- **Root.** `SHAKE256(0x02 || id_root || time_root || head || count)`:
+  - `head` is the last `entry_hash` (zeros when the file is empty);
+  - `count` is 8 bytes, little endian.
+
+### 6.3 Recall prompt (`direct-options-memory-v1`)
+
+With `--recall N` (and `--memory`), the prompt of section 2 changes in two
+places. It is otherwise byte-identical.
+
+- **System text.** The sentence
+  `Earlier decisions are listed under memory, oldest first; treat them as context only.`
+  is appended after one space.
+- **User JSON.** It begins with a `memory` key holding the last N lines as
+  `{"criterion": question, "answer": answer_text}`, oldest first:
+  `{"memory": [...], "evidence": ..., "criterion": ..., "options": [...]}`.
+  The list is `[]` while the file is empty.
+- **Which lines are recalled.**
+  - Direct mode: each row sees every line stored before it, including lines
+    from earlier rows of the same run.
+  - Shared mode: all rows see the memory as it was when the batch started, so
+    they still share a token prefix.
+- **Output rows.** They report `prompt_version: direct-options-memory-v1`.
+  Every output row written with `--memory` also has
+  `"memory": {"seq", "recalled"}`.
+
+These results are not comparable with the published `direct-options-v1`
+results.
+
+### 6.4 Proofs
+
+`memory-prove` writes a JSON proof. The proof carries:
+
+- `id_root`, `time_root`, `head`, `count` and `root`;
+- the non-empty siblings, as `[height, hex]` pairs; every other sibling is
+  `empty[height]`.
+
+`memory-verify` checks a proof without the memory file. It rebuilds `root`,
+and checks it against `--root` when one is given. Then it checks the claim:
+
+- **`id-membership`.** `leaf(entry)` at `key(id)` climbs to `id_root`, and
+  the entry's `id` is that id. This shows the entry is the latest decision
+  for that id.
+- **`id-absence`.** `empty[0]` at `key(id)` climbs to `id_root`, so the id
+  was never recorded.
+- **`time-exclusion` over `[from, to]`.** A time leaf `(key, value, next)`
+  climbs to `time_root`, and `(key < from or key = 0) and from <= to < next`.
+  The leaf's own key is a recorded time unless it is the genesis leaf, so the
+  weaker condition `key <= from` would let an entry at exactly `from` be
+  claimed absent.
+
+Exclusion proofs trust that the time tree's `next` pointers were built
+honestly. Anyone who holds the file can recompute every root with
+`memory-root`, which rebuilds the trees from the verified chain.
+
+### 6.5 Zero-knowledge range proof
+
+`zk/memory_range.circom` (Circom 2, BN254, circomlib Poseidon) proves that
+entries `startIndex .. startIndex + rangeSize - 1` exist, without revealing
+them. The leaves are private.
+
+- **Leaves.** `leaf_k = int(entry_hash_k) mod p`. Position `k` is `seq`.
+  Positions past the log hold 0.
+- **Tree.** A binary Poseidon(2) tree of depth 16 over the leaves.
+- **Public inputs.** `root`, `startIndex` and `rangeSize` (1 to 8).
+- **Output.** `rangeCommitment`, a Poseidon chain over the active leaves.
+- **Constraints.**
+  - Each active slot `i` has its own Merkle path. The path directions are
+    the bits of `startIndex + i`.
+  - Active leaves are nonzero.
+  - `startIndex` and `rangeSize` are bit-decomposed before any comparison.
+
+`zk/memory_zk_inputs.js` builds the input from a memory file. The Poseidon
+root is a separate commitment from the SHAKE256 `root`, and the engine does
+not compute it. Publish both together.

@@ -11,6 +11,11 @@ static const char LETTERS[] = "ABCDEFGHIJKLMNOP";
 static const char SYSTEM[] =
     "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. "
     "Respond with only its uppercase letter, with no explanation or reasoning.";
+/* direct-options-memory-v1: the same instructions plus earlier decisions as context (SPEC.md 6.3) */
+static const char SYSTEM_MEMORY[] =
+    "Apply the supplied criterion to the supplied evidence. Choose exactly one listed option. "
+    "Respond with only its uppercase letter, with no explanation or reasoning. "
+    "Earlier decisions are listed under memory, oldest first; treat them as context only.";
 
 static bool finite_tree(const jval *v) {
     switch (v->type) {
@@ -158,14 +163,20 @@ void decision_prompt(const decision_t *d, const chat_format_t *fmt, sbuf_t *out)
     if (fmt->kind == CHAT_LLAMA3) {
         sb_puts(out, fmt->bos);
         sb_puts(out, "<|start_header_id|>system<|end_header_id|>\n\n");
-        sb_puts(out, SYSTEM);
+        sb_puts(out, d->memory ? SYSTEM_MEMORY : SYSTEM);
         sb_puts(out, "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n");
     } else {
         sb_puts(out, "<|im_start|>system\n");
-        sb_puts(out, SYSTEM);
+        sb_puts(out, d->memory ? SYSTEM_MEMORY : SYSTEM);
         sb_puts(out, "<|im_end|>\n<|im_start|>user\n");
     }
-    sb_puts(out, "{\"evidence\": ");
+    if (d->memory) {
+        sb_puts(out, "{\"memory\": ");
+        sb_putn(out, d->memory, d->memory_len);
+        sb_puts(out, ", \"evidence\": ");
+    } else {
+        sb_puts(out, "{\"evidence\": ");
+    }
     json_dump_py(out, json_get(d->row, "state"));
     sb_puts(out, ", \"criterion\": ");
     const jval *q = json_get(d->row, "question");

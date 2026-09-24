@@ -1,10 +1,13 @@
 /* test_unit.c - model-free checks for the host library. Run with `make test`. */
+#define _POSIX_C_SOURCE 200809L
 #include "transformer.h"
 
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
 
 static int failures;
 
@@ -48,6 +51,37 @@ static void roundtrip(const char *in, const char *want) {
         sb_free(&b);
     }
     arena_free(&a);
+}
+
+static void hexn(const uint8_t *b, size_t n, char *out) {
+    for (size_t k = 0; k < n; k++) sprintf(out + 2 * k, "%02x", b[k]);
+}
+
+static void test_shake256(void) {
+    /* first 16 bytes of a 64-byte digest and last 16 of a 300-byte digest, from hashlib.shake_256 */
+    const struct { size_t len; const char *head, *tail; } v[] = {
+        {0, "46b9dd2b0ba88d13233b3feb743eeb24", "ff96390bf9a66d1368b208e21f7c10d0"},
+        {3, "483366601360a8771c6863080cc4114d", "ddcbec7da52b42215c11d5f8ee57f341"},
+        {135, "55b991ece1e567b6e7c2c714444dd201", "279c5f056efc15a05097063c290fa1d6"},
+        {136, "8fcc5a08f0a1f6827c9cf64ee8d16e04", "204daa45a23735cae20fd6f006f1857f"},
+        {137, "a44e1a438dad6273d540be65ee26386c", "11929d4d9fc3573383f1494c01d9a405"},
+        {768, "2c08d3827f9ced84c8263c16ac1d877a", "e0f2bb2035a07d8b5db20bcbade3ac92"},
+    };
+    uint8_t msg[768], out[300];
+    for (size_t k = 0; k < sizeof v / sizeof *v; k++) {
+        for (size_t i = 0; i < v[k].len; i++) msg[i] = v[k].len == 3 ? (uint8_t)"abc"[i] : v[k].len == 768 ? (uint8_t)(i % 256) : 'a';
+        char hex[65];
+        shake256(msg, v[k].len, out, 64);
+        hexn(out, 16, hex);
+        CHECK(!strcmp(hex, v[k].head), "shake256 len %zu head %s", v[k].len, hex);
+        /* incremental, in uneven pieces, with a long squeeze */
+        shake256_t s;
+        shake256_init(&s);
+        for (size_t i = 0; i < v[k].len; i += 7) shake256_update(&s, msg + i, v[k].len - i < 7 ? v[k].len - i : 7);
+        shake256_final(&s, out, 300);
+        hexn(out + 284, 16, hex);
+        CHECK(!strcmp(hex, v[k].tail), "shake256 len %zu tail %s", v[k].len, hex);
+    }
 }
 
 static void test_json(void) {
@@ -306,13 +340,92 @@ static void test_verify(void) {
     arena_free(&f.ar);
 }
 
+/* ---- decision memory: append, reopen, recall, prove and verify, tamper detection */
+static void test_memory(void) {
+    char path[] = "build/test-memory-XXXXXX";
+    int fd = mkstemp(path);
+    CHECK(fd >= 0, "mkstemp");
+    if (fd < 0) return;
+    close(fd);
+    memory_t *m;
+    CHECK(!memory_open(path, true, &m), "open empty: %s", last_error());
+    arena_t a;
+    arena_init(&a, 0);
+    const char *rows[] = {ROW1, ROW2, ROW1};
+    const double p2[2] = {0.25, 0.75}, p3[3] = {0.6, 0.3, 0.1};
+    for (int k = 0; k < 3; k++) {
+        jval *v;
+        decision_t d;
+        json_parse(&a, rows[k], strlen(rows[k]), &v);
+        decision_validate(v, &d);
+        CHECK(!memory_append(m, &d, d.n_options == 2 ? p2 : p3, "00", PROMPT_VERSION, "rev", 0), "append: %s", last_error());
+    }
+    sbuf_t recall = {0}, root1 = {0}, root2 = {0}, proof = {0}, summary = {0};
+    memory_recall_json(m, 2, &recall);
+    CHECK(!strcmp(recall.data, "[{\"criterion\": \"q?\", \"answer\": \"x\"}, {\"criterion\": \"q?\", \"answer\": \"y\"}]"),
+          "recall: %s", recall.data);
+    memory_root_json(m, &root1);
+    memory_close(m);
+
+    memory_t *w1;
+    CHECK(!memory_open(path, true, &w1), "reopen: %s", last_error());
+    CHECK(memory_count(w1) == 3, "count after reopen");
+    /* a second process cannot append while this one holds the file (POSIX locks are per process) */
+    pid_t child = fork();
+    if (child == 0) {
+        memory_t *w2;
+        _exit(memory_open(path, true, &w2) && strstr(last_error(), "in use") ? 0 : 1);
+    }
+    int status = -1;
+    waitpid(child, &status, 0);
+    CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0, "second writer was not refused");
+    memory_close(w1);
+
+    CHECK(!memory_open(path, false, &m), "read-only open: %s", last_error());
+    memory_root_json(m, &root2);
+    CHECK(!strcmp(root1.data, root2.data), "roots change on reload");
+    /* r1's latest entry is seq 2 (answer "y": p = 0.75); r9 was never decided */
+    const char *ids[] = {"r1", "r9"};
+    for (int k = 0; k < 2; k++) {
+        proof.len = 0, summary.len = 0;
+        jval *pv;
+        CHECK(!memory_prove_id(m, ids[k], 2, &proof) && !json_parse(&a, proof.data, proof.len, &pv) &&
+                  !memory_verify_proof(pv, NULL, &summary),
+              "prove/verify %s: %s", ids[k], last_error());
+        CHECK(strstr(summary.data, k ? "never recorded" : "latest entry") != NULL, "summary %s", summary.data);
+        if (k == 0) CHECK(strstr(proof.data, "\\\"seq\\\": 2") != NULL, "latest entry for r1 should be seq 2");
+    }
+    proof.len = 0;
+    CHECK(memory_prove_gap(m, 1, 5, &proof) == 0, "gap before the first entry: %s", last_error());
+    memory_close(m);
+
+    /* change one byte of the first entry: the chain no longer holds */
+    char *text;
+    size_t len;
+    read_file(path, &text, &len);
+    char *hit = strstr(text, "\"answer_text\": \""); /* first entry's answer text */
+    CHECK(hit != NULL, "no answer_text in memory file");
+    if (hit) hit[16] = hit[16] == 'z' ? 'w' : 'z';
+    FILE *f = fopen(path, "wb");
+    fwrite(text, 1, len, f);
+    fclose(f);
+    free(text);
+    CHECK(memory_open(path, false, &m) && strstr(last_error(), "history was changed"), "tampered memory accepted: %s",
+          last_error());
+    remove(path);
+    sb_free(&recall), sb_free(&root1), sb_free(&root2), sb_free(&proof), sb_free(&summary);
+    arena_free(&a);
+}
+
 int main(void) {
     test_sha256();
+    test_shake256();
     test_json();
     test_unicode();
     test_rows();
     test_float_repr_roundtrip();
     test_verify();
+    test_memory();
     if (failures) {
         printf("%d unit check(s) failed\n", failures);
         return 1;

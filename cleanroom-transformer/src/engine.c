@@ -56,10 +56,34 @@ static int write_result(const engine_t *e, const decision_t *d, const encoded_t 
         json_dump_double(out, total_s);
     }
     sb_printf(out, ", \"prompt_sha256\": \"%s\", \"prompt_version\": \"%s\", \"model\": ", enc->sha256,
-              PROMPT_VERSION);
+              d->memory ? PROMPT_VERSION_MEMORY : PROMPT_VERSION);
     model_meta(e, out, serving);
     sb_puts(out, ", \"readout\": \"native last-position logits restricted to declared answer slots\""
                  ", \"probability_status\": \"conditional option score; uncalibrated as decision confidence\"}");
+    return 0;
+}
+
+/* With recall on, the prompt carries the last e->recall decisions (an empty list when there are none yet). */
+static uint32_t attach_recall(const engine_t *e, decision_t *d, sbuf_t *buf) {
+    if (!e->memory || !e->recall) return 0;
+    buf->len = 0;
+    memory_recall_json(e->memory, e->recall, buf);
+    d->memory = buf->data, d->memory_len = buf->len;
+    size_t n = memory_count(e->memory);
+    return n < e->recall ? (uint32_t)n : e->recall;
+}
+
+/* Stores the decision, then reopens the result object just written to say where it went. */
+static int remember(engine_t *e, const decision_t *d, const encoded_t *enc, const float *logits, uint32_t recalled,
+                    sbuf_t *out) {
+    if (!e->memory) return 0;
+    double p[MAX_OPTIONS];
+    softmax_d(logits, d->n_options, p);
+    if (memory_append(e->memory, d, p, enc->sha256, d->memory ? PROMPT_VERSION_MEMORY : PROMPT_VERSION, e->revision,
+                      recalled))
+        return -1;
+    out->len--; /* drop the closing brace */
+    sb_printf(out, ", \"memory\": {\"seq\": %zu, \"recalled\": %u}}", memory_count(e->memory) - 1, recalled);
     return 0;
 }
 
@@ -67,14 +91,22 @@ int engine_score_direct(engine_t *e, const jval *row, sbuf_t *out) {
     double started = now_seconds();
     decision_t d;
     encoded_t enc;
-    if (decision_validate(row, &d) || decision_encode(e->tok, &e->fmt, &d, e->max_tokens, &enc)) return -1;
+    sbuf_t recall = {0};
+    if (decision_validate(row, &d)) return -1;
+    uint32_t recalled = attach_recall(e, &d, &recall);
+    if (decision_encode(e->tok, &e->fmt, &d, e->max_tokens, &enc)) {
+        sb_free(&recall);
+        return -1;
+    }
     float logits[MAX_OPTIONS];
     double mark = now_seconds();
     int rc = e->be->reset(e->be);
     if (!rc) rc = e->be->forward(e->be, enc.ids, enc.n, enc.slots, d.n_options, logits);
     double fwd = now_seconds() - mark;
     if (!rc) rc = write_result(e, &d, &enc, logits, fwd, now_seconds() - started, NULL, out);
+    if (!rc) rc = remember(e, &d, &enc, logits, recalled, out);
     encoded_free(&enc);
+    sb_free(&recall);
     return rc;
 }
 
@@ -86,8 +118,14 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
     float *logits = xcalloc(n * MAX_OPTIONS, sizeof *logits);
     int rc = 0;
     size_t encoded = 0;
+    sbuf_t recall = {0}; /* one memory snapshot for the whole batch, so the rows still share a prefix */
+    uint32_t recalled = 0;
     for (size_t r = 0; r < n && !rc; r++) {
         rc = decision_validate(rows[r], &d[r]);
+        if (!rc && e->memory && e->recall) {
+            if (r == 0) recalled = attach_recall(e, &d[r], &recall);
+            d[r].memory = recall.data, d[r].memory_len = recall.len;
+        }
         for (size_t j = 0; j < r && !rc; j++)
             if (d[j].id_len == d[r].id_len && memcmp(d[j].id, d[r].id, d[r].id_len) == 0)
                 rc = set_error("Decision IDs must be unique (%.*s)", (int)d[r].id_len, d[r].id);
@@ -135,6 +173,7 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
             size_t mark = out->len;
             rc = write_result(e, &d[r], &enc[r], logits + r * MAX_OPTIONS, -1, -1,
                               "shared-token-prefix-serial-v1", out);
+            if (!rc) rc = remember(e, &d[r], &enc[r], logits + r * MAX_OPTIONS, recalled, out);
             if (!rc) {
                 out->len--; /* reopen the object to append the batch timing */
                 sb_puts(out, ", \"shared_timing\": ");
@@ -148,5 +187,6 @@ int engine_score_shared(engine_t *e, const jval *const *rows, size_t n, sbuf_t *
     }
     for (size_t r = 0; r < encoded; r++) encoded_free(&enc[r]);
     free(d), free(enc), free(logits);
+    sb_free(&recall);
     return rc;
 }
