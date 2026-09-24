@@ -3,6 +3,7 @@
 #   make            CPU reference build        -> build/cleanroom-transformer
 #   make cuda       CUDA build for sm_86       -> build/cleanroom-transformer-cuda
 #   make test       unit tests (no model needed)
+#   make check-prompts MODEL=DIR   every committed benchmark prompt vs its recorded hash (tokenizer only)
 #   make cuda-check compile the CUDA code for sm_86 without linking a binary
 #   make formal     Alloy checks of the shape contract (needs java; ALLOY_JAR or a download)
 
@@ -17,10 +18,10 @@ OMP     ?= -fopenmp
 LDLIBS  += -lm
 
 HOST_SRC := src/base.c src/json.c src/sha256.c src/unicode.c src/tokenizer.c src/prompt.c \
-            src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c
+            src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c src/verify.c
 BUILD := build
 
-.PHONY: all cuda cuda-check test formal clean
+.PHONY: all cuda cuda-check test check-prompts formal clean
 all: $(BUILD)/cleanroom-transformer
 
 $(BUILD)/cpu/%.o: src/%.c src/transformer.h src/ops_common.h src/ggml_quant.h src/unicode_tables.h
@@ -51,6 +52,18 @@ $(BUILD)/test_unit: tests/test_unit.c $(patsubst src/%.c,$(BUILD)/cpu/%.o,$(HOST
 
 test: $(BUILD)/test_unit $(BUILD)/cleanroom-transformer
 	$(BUILD)/test_unit
+
+# Each benchmark file and the predictions committed from the Python scorer's run on it (repository root).
+PROMPT_SETS := benchmarks/data/authored144.jsonl:results/raw/predictions/direct-authored144.jsonl \
+               benchmarks/data/perturbations108.jsonl:results/raw/predictions/direct-perturbations108.jsonl \
+               benchmarks/data/shape777.jsonl:results/raw/shape777-direct.predictions.jsonl
+
+check-prompts: $(BUILD)/cleanroom-transformer
+	@test -n "$(MODEL)" || { echo "usage: make check-prompts MODEL=/path/to/Qwen3.5-4B/snapshot" >&2; exit 2; }
+	@set -e; for pair in $(PROMPT_SETS); do \
+	    $(BUILD)/cleanroom-transformer verify-prompts --model "$(MODEL)" \
+	        --input ../$${pair%%:*} --expected ../$${pair##*:}; \
+	done
 
 formal: $(BUILD)/cleanroom-transformer
 	python3 tools/check_formal.py $(if $(ALLOY_JAR),--alloy $(ALLOY_JAR),)

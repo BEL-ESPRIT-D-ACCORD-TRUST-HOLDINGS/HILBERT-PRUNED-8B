@@ -26,7 +26,7 @@ The full behavioural specification is in [SPEC.md](SPEC.md).
 | GGUF loading | Verified on the CPU. All 13 supported quant formats dequantize bit-exactly against llama.cpp's reference. Tiny Llama GGUFs match PyTorch (F32) and transformers' GGUF loader (quantized) within 1e-6 relative. A released Llama 3 8B Instruct Q4_K_M file's tokenizer and prompts match Hugging Face on every row tested. **Not yet run with a full 8B GGUF** |
 | Llama 3 | Verified on the CPU with small random Llama checkpoints (F32, F16 and BF16 weights, with and without Llama 3.1 RoPE scaling): logits match PyTorch within 1e-6. Prompts match the Python implementation on 927 rows using the Llama 3 Instruct tokenizer. **Not yet run with real 8B weights** |
 | Shape contract | Proven with Alloy. Every matrix multiply in the real Qwen3.5-4B and Llama 3 8B forward passes is a valid siphon in `formal/FreehandTensorSiphon.als`, and the head-sharing, RoPE and conv-split rules hold in bounded proofs (see Formal checks) |
-| CUDA forward pass | Compiles for sm_86 with no warnings or register spills. **Not yet run on a GPU.** Run `selftest` (below) before relying on it. It also checks every quantized-weight kernel against the host decoder |
+| CUDA forward pass | Compiles for sm_86 with no warnings or register spills. **Not yet run on a GPU.** Run `selftest` (below) before relying on it. It also checks every quantized-weight kernel against the host decoder, and the fused single-token kernels against a double-precision host reference and the unfused kernels |
 
 ## Build
 
@@ -176,20 +176,59 @@ calibrated confidence.
 | `src/cpu_backend.c` | Reference forward pass in float32 |
 | `src/cuda_backend.cu` | GPU forward pass and `selftest` |
 | `src/engine.c` | Scoring, including shared-context scoring |
+| `src/verify.c` | Prompt verification against committed prediction records |
 | `src/http.c` | HTTP server |
 | `src/shapes.c` | Per-layer weight table, and the shape export for formal checks |
 | `formal/` | Alloy models of the shape contract |
+
+### GPU kernel fusion
+
+Two steps of the CUDA forward pass run as single kernels:
+
+- **Single-token feed-forward (`k_gateup_swiglu`).** When a forward call
+  has one token, one kernel computes the gate and up projections and SwiGLU
+  in a single pass over the activations. It writes the bf16 result straight
+  into a separate buffer. It keeps the per-lane order and float32
+  accumulation of the matrix-vector kernels it replaces, then rounds to bf16
+  exactly once, as before. Calls with more tokens (prefill) still use the
+  separate matrix multiplies.
+- **Final norm and readout (`k_norm_readout`).** The final RMSNorm, with the
+  same `norm_offset` and epsilon, is computed inside the readout kernel for
+  each requested token id. The normalized vector is never stored. It works
+  for any hidden size with bf16 weights and for quantized output heads.
+
+`selftest` compares both kernels with a double-precision host reference and
+with the unfused kernels. It also runs a one-token forward step against the
+CPU backend. No speed measurements have been taken, so no speed-up is
+claimed.
 
 ## Testing
 
 ```bash
 make test                                            # unit tests
-python tools/check_prompts.py --model qwen35-4b      # prompts vs committed results
+make check-prompts MODEL=qwen35-4b                   # prompts vs committed results (native)
 python tools/parity.py --tokenizer qwen35-4b/tokenizer.json \
   --llama-tokenizer llama3-8b-instruct/tokenizer.json         # vs PyTorch (needs torch, transformers)
 python tools/gguf_parity.py --llama-tokenizer llama3-8b-instruct/tokenizer.json \
   [--real-gguf Meta-Llama-3-8B-Instruct-Q4_K_M.gguf]          # GGUF (also needs: pip install gguf)
 TRANSFORMER_MODEL_DIR=qwen35-4b pytest cleanroom-transformer/tests   # all of the above
+```
+
+`make check-prompts` runs `cleanroom-transformer verify-prompts` on each
+benchmark file and the predictions committed from the Python run on it. It
+needs only the tokenizer. Every input row must have exactly one committed
+reference record (a record whose `mode` is absent or `fresh`), and the
+counts must match. Each row must then reproduce the record's
+`prompt_sha256`, `input_tokens`, `answer_token_ids` and `option_ids`.
+Missing, duplicate or malformed records fail the check. So do rows that
+cannot be encoded. It replaced `tools/check_prompts.py`, whose `zip()` over
+the output lines never checked rows missing from the end of the output.
+To check a single file:
+
+```bash
+build/cleanroom-transformer verify-prompts --model qwen35-4b \
+  --input ../benchmarks/data/authored144.jsonl \
+  --expected ../results/raw/predictions/direct-authored144.jsonl
 ```
 
 ## Formal checks
