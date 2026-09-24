@@ -59,15 +59,30 @@ renders:
     "<|im_start|>user\n" payload "<|im_end|>\n"
     "<|im_start|>assistant\n<think>\n\n</think>\n\n"
 
-The template trims message content. Neither `SYSTEM` nor a JSON object has
+The templates trim message content. Neither `SYSTEM` nor a JSON object has
 leading or trailing whitespace, so trimming changes nothing.
 
 For Llama 3 Instruct (a template with `<|start_header_id|>` and
-`<|eot_id|>`, and without the Llama 3.1 date or tools preamble), it renders:
+`<|eot_id|>`), it renders:
 
-    BOS "<|start_header_id|>system<|end_header_id|>\n\n" SYSTEM "<|eot_id|>"
+    BOS "<|start_header_id|>system<|end_header_id|>\n\n" PREAMBLE SYSTEM "<|eot_id|>"
     "<|start_header_id|>user<|end_header_id|>\n\n" payload "<|eot_id|>"
     "<|start_header_id|>assistant<|end_header_id|>\n\n"
+
+`PREAMBLE` depends on the template:
+
+- **Llama 3 templates** (without a date preamble): `PREAMBLE` is empty.
+- **Meta's official Llama 3.1 and 3.3 Instruct templates:**
+  - Recognized by their `Cutting Knowledge Date: December 2023` line,
+    together with their system-message and tool structure.
+  - With no tools, `PREAMBLE` is
+    `"Cutting Knowledge Date: December 2023\nToday Date: " date "\n\n"`.
+  - `date` is the template's own default `date_string` (`26 Jul 2024`),
+    because the scorer never passes one.
+- **Refused:**
+  - templates that insert the current date (`strftime_now`, as in Llama
+    3.2), because their prompts would change from day to day;
+  - other tool-calling templates.
 
 `BOS` is `tokenizer_config.json`'s `bos_token` (`<|begin_of_text|>`). The
 template is read from `chat_template.jinja` or `tokenizer_config.json`. Other

@@ -7,6 +7,7 @@
 #   make cuda-check compile the CUDA code for sm_86 without linking a binary
 #   make formal     Alloy checks of the shape contract (needs java; ALLOY_JAR or a download)
 #   make OQS=DIR    also link liboqs (installed under DIR) for Falcon-512 memory signatures
+#   make ep         Equilibrium Propagation tensor-core kernels + self-test -> build/ep-sm86 (ep/ep_sm86.cu)
 
 CC        ?= cc
 NVCC      ?= $(CUDA_HOME)/bin/nvcc
@@ -27,7 +28,7 @@ HOST_SRC := src/base.c src/json.c src/sha256.c src/unicode.c src/tokenizer.c src
             src/safetensors.c src/model.c src/gguf.c src/shapes.c src/cpu_backend.c src/engine.c src/http.c src/verify.c src/shake256.c src/memory.c src/sign.c
 BUILD := build
 
-.PHONY: all cuda cuda-check test check-prompts formal clean
+.PHONY: all cuda cuda-check test check-prompts formal clean ep
 all: $(BUILD)/cleanroom-transformer
 
 $(BUILD)/cpu/%.o: src/%.c src/transformer.h src/ops_common.h src/ggml_quant.h src/unicode_tables.h
@@ -50,6 +51,13 @@ $(BUILD)/cleanroom-transformer-cuda: $(patsubst src/%.c,$(BUILD)/gpu/%.o,$(HOST_
 	$(NVCC) $(CUDA_ARCH) -Xcompiler $(OMP) $^ -o $@ -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib -lcudart $(LDLIBS)
 
 cuda: $(BUILD)/cleanroom-transformer-cuda
+
+# Standalone: prints ptxas' register/shared/spill report; run build/ep-sm86 on an sm_86 GPU.
+$(BUILD)/ep-sm86: ep/ep_sm86.cu
+	@mkdir -p $(dir $@)
+	$(NVCC) -std=c++17 -O3 -gencode arch=compute_86,code=sm_86 -Xptxas -v -Xcompiler -Wall $< -o $@ \
+	    -L$(CUDA_HOME)/lib64 -L$(CUDA_HOME)/lib -lcudart
+ep: $(BUILD)/ep-sm86
 cuda-check: $(BUILD)/gpu/cuda_backend.o
 
 # ------------------------------------------------------------------ tests

@@ -137,6 +137,8 @@ typedef enum { CHAT_QWEN35 = 0, CHAT_LLAMA3 = 1 } chat_kind_t;
 typedef struct {
     chat_kind_t kind;
     char bos[64]; /* text prepended by the template, if any */
+    /* Llama 3.1/3.3 Instruct: fixed system preamble ("Cutting Knowledge Date: ...\nToday Date: ...\n\n") */
+    char system_prefix[96];
 } chat_format_t;
 
 /* Reads chat_template.jinja or tokenizer_config.json in `dir` and identifies the template. */

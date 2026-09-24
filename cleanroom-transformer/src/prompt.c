@@ -91,8 +91,40 @@ static int chat_format_detect(const char *tmpl, size_t tmpl_len, const char *bos
         out->kind = CHAT_QWEN35;
         return 0;
     }
-    if (has(tmpl, tmpl_len, "<|start_header_id|>") && has(tmpl, tmpl_len, "<|eot_id|>") &&
-        !has(tmpl, tmpl_len, "Cutting Knowledge") && !has(tmpl, tmpl_len, "tools")) {
+    const bool llama = has(tmpl, tmpl_len, "<|start_header_id|>") && has(tmpl, tmpl_len, "<|eot_id|>");
+    if (llama && has(tmpl, tmpl_len, "Cutting Knowledge Date")) {
+        /* Llama 3.1 / 3.3 Instruct. With a system and a user message and no tools it renders as Llama 3
+         * with "Cutting Knowledge Date: December 2023\nToday Date: <date_string>\n\n" before the system
+         * text, where date_string is the template's own default (SPEC.md 2). */
+        if (has(tmpl, tmpl_len, "strftime_now"))
+            return set_error("%s: this chat template inserts today's date (Llama 3.2 style), so its prompts change "
+                             "from day to day; only fixed-date templates (Llama 3.1, 3.3) are supported", where);
+        static const char *const need[] = {"{{- \"Cutting Knowledge Date: December 2023\\n\" }}",
+                                           "{{- \"Today Date: \" + date_string + \"\\n\\n\" }}", "{{- system_message }}",
+                                           "{%- set system_message = messages[0]['content']|trim %}",
+                                           "{%- if builtin_tools is defined or tools is not none %}"};
+        for (size_t k = 0; k < sizeof need / sizeof *need; k++)
+            if (!has(tmpl, tmpl_len, need[k]))
+                return set_error("%s: unrecognized Llama 3.1-style chat template (missing %s)", where, need[k]);
+        static const char key[] = "{%- set date_string = \"";
+        const char *date = NULL;
+        size_t date_len = 0;
+        for (size_t i = 0; i + sizeof key - 1 <= tmpl_len && !date; i++)
+            if (!memcmp(tmpl + i, key, sizeof key - 1)) {
+                date = tmpl + i + sizeof key - 1;
+                while (date + date_len < tmpl + tmpl_len && date[date_len] != '"' && date_len < 32) date_len++;
+            }
+        bool date_ok = date && date_len > 0 && date_len < 32 && date + date_len < tmpl + tmpl_len && date[date_len] == '"';
+        for (size_t k = 0; date_ok && k < date_len; k++)
+            date_ok = (date[k] >= '0' && date[k] <= '9') || (date[k] >= 'A' && date[k] <= 'Z') ||
+                      (date[k] >= 'a' && date[k] <= 'z') || date[k] == ' ';
+        if (!date_ok) return set_error("%s: the Llama 3.1-style chat template has no fixed default date_string", where);
+        snprintf(out->system_prefix, sizeof out->system_prefix,
+                 "Cutting Knowledge Date: December 2023\nToday Date: %.*s\n\n", (int)date_len, date);
+    } else if (llama && has(tmpl, tmpl_len, "tools")) {
+        return set_error("%s: unsupported tool-calling chat template", where);
+    }
+    if (llama) {
         out->kind = CHAT_LLAMA3;
         if (has(tmpl, tmpl_len, "bos_token")) {
             if (!bos || bos_len >= sizeof out->bos)
@@ -163,6 +195,7 @@ void decision_prompt(const decision_t *d, const chat_format_t *fmt, sbuf_t *out)
     if (fmt->kind == CHAT_LLAMA3) {
         sb_puts(out, fmt->bos);
         sb_puts(out, "<|start_header_id|>system<|end_header_id|>\n\n");
+        sb_puts(out, fmt->system_prefix);
         sb_puts(out, d->memory ? SYSTEM_MEMORY : SYSTEM);
         sb_puts(out, "<|eot_id|><|start_header_id|>user<|end_header_id|>\n\n");
     } else {
