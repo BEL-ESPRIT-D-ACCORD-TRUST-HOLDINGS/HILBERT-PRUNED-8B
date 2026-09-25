@@ -193,6 +193,7 @@ Returned probabilities are conditional on the supplied options. Calibrate and va
 - [Interactive replay](demo/index.html)
 - [Browser-only WebGPU demo](webgpu-demo/index.html) — no waitlist; use it today
 - [Decision memory playground](playground/README.md): the engine's `memory-*` commands in the browser, on a WebAssembly core
+- [roam](roaming/README.md): portable `.roam` session bundles, an audited God mode and the Windows GodMode folder, in plain Node.js and in C#
 - [Machine-readable summary](results/phase1-summary.json)
 - [Benchmark bundle](benchmarks/README.md) — fixtures, runners, selection IDs, and reproduction commands
 - [Raw results and checksums](results/raw/)
