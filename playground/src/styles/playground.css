@@ -1,0 +1,154 @@
+/* Terminal and file viewer, built on the tokens in tokens.css. */
+.pg-terminal {
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.pg-terminal:hover {
+  box-shadow: var(--shadow-sm);
+}
+
+.pg-bar {
+  gap: 0.75rem;
+  padding: 0.5rem 0.75rem 0.5rem 1rem;
+  border-bottom: 1px solid var(--border-subtle);
+  background-color: var(--bg-elevated);
+}
+
+.pg-bar-title {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  color: var(--text-secondary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.pg-bar-actions {
+  display: flex;
+  gap: 0.5rem;
+  flex-shrink: 0;
+}
+
+.pg-bar .btn {
+  padding: 0.25rem 0.75rem;
+  font-size: 0.8125rem;
+}
+
+.pg-screen {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  line-height: 1.55;
+  height: clamp(340px, 58vh, 720px);
+  overflow: auto;
+  padding: 0.875rem 1rem;
+  background-color: var(--bg-surface);
+  color: var(--text-primary);
+  overscroll-behavior: contain;
+}
+
+.pg-screen pre {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  font-size: inherit;
+}
+
+.pg-entry + .pg-entry {
+  margin-top: 0.625rem;
+}
+
+.pg-cmd {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pg-ps1 {
+  color: var(--brand-primary);
+  font-weight: 600;
+  user-select: none;
+}
+
+.pg-banner {
+  color: var(--text-secondary);
+}
+
+.pg-meta {
+  display: inline-flex;
+  gap: 0.5rem;
+  margin-left: 0.5rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  user-select: none;
+}
+
+.pg-exit {
+  padding: 0 0.375rem;
+  border-radius: var(--radius-sm);
+  border: 1px solid currentColor;
+}
+
+.pg-input-row {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  border-top: 1px solid var(--border-subtle);
+  background-color: var(--bg-surface);
+}
+
+.pg-input-row .input {
+  font-family: var(--font-mono);
+  font-size: 0.8125rem;
+  border-color: transparent;
+  padding-inline: 0.25rem;
+  background: transparent;
+}
+
+.pg-input-row .input::placeholder {
+  color: var(--text-muted);
+}
+
+.pg-input-row .input:focus {
+  border-color: var(--border-subtle);
+}
+
+.pg-hint {
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  white-space: nowrap;
+}
+
+.pg-file-view {
+  max-height: 60vh;
+  font-size: 0.8125rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pg-preview {
+  display: block;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.pg-drop {
+  outline: 2px dashed var(--brand-primary);
+  outline-offset: 4px;
+  border-radius: var(--radius-lg);
+}
+
+@media (max-width: 640px) {
+  .pg-hint {
+    display: none;
+  }
+  .pg-screen {
+    height: 52vh;
+    font-size: 0.75rem;
+  }
+}

@@ -176,6 +176,9 @@ typedef struct memory memory_t;
 int memory_open(const char *path, bool writable, memory_t **out);
 void memory_close(memory_t *m);
 size_t memory_count(const memory_t *m);
+/* Deterministic timestamps for later appends: entry seq gets start_us + seq (still forced strictly after the
+ * previous entry). Makes the file and its roots reproducible; the default is the wall clock. */
+int memory_set_clock(memory_t *m, uint64_t start_us);
 /* Optional per-entry extras: a caller-supplied JSON object, and a hidden-state vector. */
 typedef struct {
     const char *meta; /* canonical JSON object text, or NULL */

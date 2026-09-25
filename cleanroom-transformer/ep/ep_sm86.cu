@@ -30,7 +30,7 @@ constexpr int WM = 64, WN = 32;
 constexpr int MT = WM / 16, NT = WN / 8;     // 4 x 4 mma.m16n8k16 per warp per k16
 constexpr int TILE_BYTES = BM * BK * 2;      // 8192: one operand tile, either layout
 constexpr int STAGE_BYTES = 2 * TILE_BYTES;  // A + B
-constexpr int SMEM_BYTES = STAGES * STAGE_BYTES;  // 49152 dynamic (+ 128 B static: 3 mbarriers, 128-aligned)
+constexpr int SMEM_BYTES = STAGES * STAGE_BYTES;  // 49152 dynamic (+ 128 B static: 3 mbarriers, warp sums)
 static_assert(BM == BN, "one tile size serves both operand layouts");
 
 // Operand layouts in global memory:
@@ -54,7 +54,8 @@ struct Epilogue {
     const bf16 *target;  // [M][N] or null (hidden layers)
     float beta;
     bf16 *s_new;         // [M][N]
-    float *delta;        // sum |s_new - s_old|
+    float *delta;        // += sum |s_new - s_old|, reduced deterministically (see ep_delta_finish_kernel)
+    float *slots;        // one partial |ds| per output tile (or per 32-pair chunk for split-K), fixed order
     // update
     float *w32;          // [N][K] master weights (M dim of the GEMM = out dim)
     bf16 *w16;           // bf16 copy used by relax
@@ -264,12 +265,30 @@ __device__ __forceinline__ float epi_pair(const Epilogue &ep, int r, int c, floa
     return 0.f;
 }
 
-// Warp tree reduction in registers, one atomic per warp. Whole warps only.
-__device__ __forceinline__ void add_delta(const Epilogue &ep, float dsum, int lane) {
-    if (ep.kind != 0) return;
+// Deterministic |ds|: no floating-point atomics anywhere. Every partial goes to a fixed slot and is summed in a
+// fixed order, so the value is bit-identical run to run and across data-parallel / Stream-K (both produce the
+// same per-tile partials). Whole warps only.
+__device__ __forceinline__ float warp_sum(float v) {
 #pragma unroll
-    for (int d = 16; d > 0; d >>= 1) dsum += __shfl_down_sync(0xffffffffu, dsum, d);
-    if (lane == 0) atomicAdd(ep.delta, dsum);
+    for (int d = 16; d > 0; d >>= 1) v += __shfl_down_sync(0xffffffffu, v, d);
+    return v;  // valid in lane 0
+}
+
+// Per tile: warps reduce by shuffle, then warp sums 0..7 are added in order into slots[tile].
+// Reusing wsum for a Stream-K block's next tile is safe: that tile's mainloop hits __syncthreads before
+// its epilogue, after thread 0 has read wsum here.
+__device__ __forceinline__ void tile_delta(const Epilogue &ep, float dsum, int tid, int tile) {
+    __shared__ float wsum[THREADS / 32];
+    if (ep.kind != 0) return;  // kernel-uniform
+    dsum = warp_sum(dsum);
+    if ((tid & 31) == 0) wsum[tid >> 5] = dsum;
+    __syncthreads();
+    if (tid == 0) {
+        float t = 0.f;
+#pragma unroll
+        for (int w = 0; w < THREADS / 32; w++) t += wsum[w];
+        ep.slots[tile] = t;
+    }
 }
 
 // Fused epilogue of a finished tile. Accumulator c[0..1] = (row lane/4, cols 2*(lane%4)+{0,1}),
@@ -285,7 +304,7 @@ __device__ __forceinline__ void epilogue(const Epilogue &ep, const Ctx &x, int m
             for (int h = 0; h < 2; h++)
                 dsum += epi_pair(ep, m0 + x.wm0 + i * 16 + (x.lane >> 2) + h * 8,
                                  n0 + x.wn0 + j * 8 + (x.lane & 3) * 2, acc[i][j][2 * h], acc[i][j][2 * h + 1]);
-    add_delta(ep, dsum, x.lane);
+    tile_delta(ep, dsum, x.tid, (m0 / BM) * (ep.ldc / BN) + n0 / BN);
 }
 
 __device__ __forceinline__ Ctx setup(unsigned char *smem, uint64_t *full) {
@@ -308,7 +327,8 @@ __device__ __forceinline__ Ctx setup(unsigned char *smem, uint64_t *full) {
 //  Registers / thread : 128 (ptxas, CUDA 12.8), 0 B stack, 0 spills; cap from __launch_bounds__(256, 2) =
 //                       65536 / (2 x 256). 64 f32 accumulators + 16 A + 8 B fragment registers + addressing.
 //                       `make ep` prints ptxas' report.
-//  Shared / block     : 49152 B dynamic (3 stages x (8 KB A + 8 KB B)) + 128 B static (3 mbarriers).
+//  Shared / block     : 49152 B dynamic (3 stages x (8 KB A + 8 KB B)) + 128 B static (3 mbarriers and the
+//                       8-float warp-sum buffer).
 //  Occupancy          : 2 blocks x 256 threads = 512 threads = 16 warps / SM (4 per SMSP), 33% of 48.
 //                       Limited jointly by registers (2 x 256 x 128 = 65536) and shared memory
 //                       (2 x (49152 + 128 + 1024 reserved) = 100608 B of 102400; needs the max-shared
@@ -452,12 +472,12 @@ __global__ void __launch_bounds__(THREADS, 6)
 ep_splitk_reduce_kernel(Epilogue ep, int M, int N, int S, const float *__restrict__ ws) {
     const int pairs = M * (N / 2), lane = threadIdx.x & 31;
     const size_t slice = (size_t)M * N;
-    float dsum = 0.f;
     // grid-stride with a warp-uniform trip count, so the final shuffle reduction always has whole warps
     const int stride = gridDim.x * blockDim.x;
     const int first = blockIdx.x * blockDim.x + (threadIdx.x & ~31);
-    for (int base = first; base < pairs; base += stride) {
+    for (int base = first; base < pairs; base += stride) {  // each warp iteration = one 32-pair chunk
         const int idx = base + lane;
+        float dsum = 0.f;
         if (idx < pairs) {  // only the last partial warp is predicated
             const int r = idx / (N / 2), c = (idx - r * (N / 2)) * 2;
             float2 v = __ldcg((const float2 *)(ws + (size_t)r * N + c));
@@ -465,10 +485,29 @@ ep_splitk_reduce_kernel(Epilogue ep, int M, int N, int S, const float *__restric
                 const float2 u = __ldcg((const float2 *)(ws + z * slice + (size_t)r * N + c));
                 v.x += u.x, v.y += u.y;
             }
-            dsum += epi_pair(ep, r, c, v.x, v.y);
+            dsum = epi_pair(ep, r, c, v.x, v.y);
+        }
+        if (ep.kind == 0) {  // chunk base/32 -> its own slot: independent of the grid size
+            dsum = warp_sum(dsum);
+            if (lane == 0) ep.slots[base >> 5] = dsum;
         }
     }
-    add_delta(ep, dsum, lane);
+}
+
+// delta += sum of n slots, in a fixed order: each of 1024 threads sums a fixed stride, then a fixed tree.
+// Grid: 1 block of 1024. Memory-bound, negligible (n = tiles, or pairs / 32).
+__global__ void __launch_bounds__(1024) ep_delta_finish_kernel(const float *__restrict__ slots, int n,
+                                                                float *__restrict__ delta) {
+    __shared__ float part[32];
+    float v = 0.f;
+    for (int i = threadIdx.x; i < n; i += 1024) v += slots[i];
+    v = warp_sum(v);
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = v;
+    __syncthreads();
+    if (threadIdx.x < 32) {
+        v = warp_sum(part[threadIdx.x]);
+        if (threadIdx.x == 0) *delta += v;
+    }
 }
 
 // ======================================================================================================
@@ -496,6 +535,9 @@ static int check_shape(int M, int N, int K, const char *what) {
 static int g_mode = 0, g_splits = 2;
 static float *g_splitk_ws = NULL;
 static size_t g_splitk_bytes = 0;
+static float *g_slots = NULL;  // deterministic |ds| partials
+static size_t g_slot_count = 0;
+static int g_streamk_grid = 0;  // 0 = every resident block; > 0 pins G (same bits on any GPU that fits it)
 static int g_resident = 0;  // blocks of 256 resident at once on the whole GPU
 static float *g_partials = NULL;
 static int *g_flags = NULL, g_epoch = 0;
@@ -525,9 +567,21 @@ static int launch_ready(void) {
     return 0;
 }
 
-static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &ep, int M, int N, cudaStream_t st) {
+static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &ep_in, int M, int N,
+                  cudaStream_t st) {
     if (launch_ready()) return -1;
     const int tiles_n = N / BN, tiles = (M / BM) * tiles_n;
+    Epilogue ep = ep_in;
+    const size_t nslots = g_mode == 3 ? ((size_t)M * (N / 2) + 31) / 32 : (size_t)tiles;
+    if (ep.kind == 0) {
+        if (nslots > g_slot_count) {
+            cudaFree(g_slots);
+            g_slots = NULL, g_slot_count = 0;
+            CK(cudaMalloc(&g_slots, nslots * sizeof(float)));
+            g_slot_count = nslots;
+        }
+        ep.slots = g_slots;
+    }
     const int kiters = a.ktiles + (nseg > 1 ? b.ktiles : 0);
     // Data-parallel when the last wave is at least 3/4 full or there are many waves; Stream-K otherwise.
     const int waves = (tiles + g_resident - 1) / g_resident, tail = tiles - (waves - 1) * g_resident;
@@ -557,12 +611,31 @@ static int launch(const Segment &a, const Segment &b, int nseg, const Epilogue &
             fprintf(stderr, "ep: %lld k-tile iterations exceed the Stream-K 32-bit range\n", work);
             return -1;
         }
-        const int G = (int)(work < g_resident ? work : g_resident);
+        const int cap = g_streamk_grid ? g_streamk_grid : g_resident;
+        if (cap > g_resident) {
+            fprintf(stderr, "ep: pinned Stream-K grid %d exceeds the %d blocks this GPU keeps resident\n", cap,
+                    g_resident);
+            return -1;
+        }
+        const int G = (int)(work < cap ? work : cap);
         g_epoch = g_epoch == 0x7fffffff ? 1 : g_epoch + 1;
         ep_gemm_streamk_kernel<<<G, THREADS, SMEM_BYTES, st>>>(a, b, nseg, ep, tiles_n, kiters, (int)work, g_partials,
                                                                g_flags, g_epoch);
     }
     CK(cudaGetLastError());
+    if (ep.kind == 0) {
+        ep_delta_finish_kernel<<<1, 1024, 0, st>>>(g_slots, (int)nslots, ep.delta);
+        CK(cudaGetLastError());
+    }
+    return 0;
+}
+
+// Reproducibility across GPUs: the automatic mode and Stream-K's split depend on how many blocks the GPU keeps
+// resident. Pinning the mode (ep_set_decomposition) and, for Stream-K, the grid makes results bit-identical on
+// every GPU that can hold that grid. grid = 0 restores "all resident blocks".
+extern "C" int ep_set_streamk_grid(int grid) {
+    if (grid < 0) return -1;
+    g_streamk_grid = grid;
     return 0;
 }
 
@@ -733,6 +806,49 @@ static int test_update(int N, int K, int M) {
     return 0;
 }
 
+// Bit-identical repeats: the same relax (feedback + nudge) and update, twice, must give identical outputs,
+// identical |ds| and identical weights.
+static int test_repeat(const char *what) {
+    const int M = 256, N = 384, Kp = 512, Kn = 128;
+    Buf prev, W, next, Wn, old, y;
+    if (buf(prev, (size_t)M * Kp, 0, 1) || buf(W, (size_t)N * Kp, -0.08f, 0.08f) || buf(next, (size_t)M * Kn, 0, 1) ||
+        buf(Wn, (size_t)Kn * N, -0.08f, 0.08f) || buf(old, (size_t)M * N, 0, 1) || buf(y, (size_t)M * N, 0, 1))
+        return -1;
+    float *bias, *delta, *w32;
+    bf16 *out, *w16;
+    CK(cudaMalloc(&bias, N * 4));
+    CK(cudaMemset(bias, 0, N * 4));
+    CK(cudaMalloc(&delta, 4));
+    CK(cudaMalloc(&out, (size_t)M * N * 2));
+    CK(cudaMalloc(&w32, (size_t)N * Kp * 4));
+    CK(cudaMalloc(&w16, (size_t)N * Kp * 2));
+    uint16_t *o[2];
+    float d[2];
+    float *w[2];
+    for (int r = 0; r < 2; r++) {
+        CK(cudaMemset(delta, 0, 4));
+        CK(cudaMemset(w32, 0, (size_t)N * Kp * 4));
+        if (ep_relax(prev.d, Kp, W.d, next.d, Kn, Wn.d, bias, old.d, y.d, 0.5f, out, M, N, delta, 0) ||
+            ep_update(old.d, prev.d, y.d, prev.d, w32, w16, N, Kp, M, 1e-3f, 0))
+            return -1;
+        CK(cudaDeviceSynchronize());
+        o[r] = (uint16_t *)malloc((size_t)M * N * 2);
+        w[r] = (float *)malloc((size_t)N * Kp * 4);
+        CK(cudaMemcpy(o[r], out, (size_t)M * N * 2, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(&d[r], delta, 4, cudaMemcpyDeviceToHost));
+        CK(cudaMemcpy(w[r], w32, (size_t)N * Kp * 4, cudaMemcpyDeviceToHost));
+    }
+    const bool same = !memcmp(o[0], o[1], (size_t)M * N * 2) && !memcmp(&d[0], &d[1], 4) &&
+                      !memcmp(w[0], w[1], (size_t)N * Kp * 4);
+    failures += !same;
+    printf("  %-58s %s\n", what, same ? "bit-identical  ok" : "DIFFERENT  FAIL");
+    for (int r = 0; r < 2; r++) free(o[r]), free(w[r]);
+    cudaFree(prev.d), cudaFree(W.d), cudaFree(next.d), cudaFree(Wn.d), cudaFree(old.d), cudaFree(y.d);
+    cudaFree(bias), cudaFree(delta), cudaFree(out), cudaFree(w32), cudaFree(w16);
+    free(prev.h), free(W.h), free(next.h), free(Wn.h), free(old.h), free(y.h);
+    return 0;
+}
+
 // A full EP step on a 3-layer network: input (fixed) -> hidden -> output.
 static int demo_step(void) {
     const int M = 256, D0 = 512, D1 = 512, D2 = 128, TFREE = 20, TNUDGE = 8;
@@ -867,6 +983,17 @@ int main(int argc, char **argv) {
             test_relax(512, 256, 4096, 0, false) || test_update(128, 256, 128) || test_update(384, 256, 512))
             return 1;
     }
+    printf("determinism (two identical runs, relax + update):\n");
+    for (int v = 1; v <= 4; v++) {
+        ep_set_decomposition(v < 4 ? v : 3, v == 4 ? 3 : 2);
+        char what[96];
+        snprintf(what, sizeof what, "%s repeat", names[v]);
+        if (test_repeat(what)) return 1;
+    }
+    ep_set_decomposition(2, 2);
+    ep_set_streamk_grid(64);
+    if (test_repeat("Stream-K, grid pinned to 64 blocks, repeat")) return 1;
+    ep_set_streamk_grid(0);
     ep_set_decomposition(0, 2);
     printf("automatic choice:\n");
     if (demo_step() || bench()) return 1;

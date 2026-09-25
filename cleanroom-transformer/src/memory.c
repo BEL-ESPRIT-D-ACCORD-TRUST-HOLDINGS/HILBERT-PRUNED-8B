@@ -45,6 +45,7 @@ typedef struct {
 struct memory {
     char *path;
     int fd; /* open for appending (locked), or -1 when read-only */
+    uint64_t clock0; /* > 0: deterministic clock, entry seq gets clock0 + seq (SPEC.md 6.1) */
     entry_t *e;
     size_t n, cap;
 };
@@ -481,13 +482,24 @@ void memory_close(memory_t *m) {
 
 size_t memory_count(const memory_t *m) { return m->n; }
 
+int memory_set_clock(memory_t *m, uint64_t start_us) {
+    if (start_us == 0 || start_us >= UINT64_MAX / 2) return set_error("memory clock start must be > 0");
+    m->clock0 = start_us;
+    return 0;
+}
+
 /* ------------------------------------------------------------------ append */
 int memory_append(memory_t *m, const decision_t *d, const double *p, const char *prompt_sha256,
                   const char *prompt_version, const char *revision, uint32_t recalled, const memory_extra_t *x) {
     if (m->fd < 0) return set_error("memory: opened read-only");
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    uint64_t t = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    uint64_t t;
+    if (m->clock0) {
+        t = m->clock0 + m->n;
+    } else {
+        clock_gettime(CLOCK_REALTIME, &ts);
+        t = (uint64_t)ts.tv_sec * 1000000u + (uint64_t)ts.tv_nsec / 1000u;
+    }
     if (m->n && t <= m->e[m->n - 1].time_us) t = m->e[m->n - 1].time_us + 1; /* keep time strictly increasing */
     uint32_t best = 0;
     for (uint32_t k = 1; k < d->n_options; k++)

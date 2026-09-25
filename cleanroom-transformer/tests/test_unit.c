@@ -145,7 +145,7 @@ static void test_rows(void) {
     decision_t d;
     CHECK(!json_parse(&a, good, strlen(good), &v) && !decision_validate(v, &d), "valid row: %s", last_error());
     sbuf_t p = {0};
-    chat_format_t qwen = {CHAT_QWEN35, ""};
+    chat_format_t qwen = {CHAT_QWEN35, "", ""};
     decision_prompt(&d, &qwen, &p);
     const char *want =
         "<|im_start|>system\nApply the supplied criterion to the supplied evidence. Choose exactly one listed "
@@ -417,6 +417,45 @@ static void test_memory(void) {
     arena_free(&a);
 }
 
+/* --memory-clock: the same decisions with the same clock start give byte-identical files and roots */
+static void test_memory_clock(void) {
+    char *text[2] = {0};
+    size_t len[2] = {0};
+    sbuf_t root[2] = {{0}, {0}};
+    arena_t a;
+    arena_init(&a, 0);
+    const double p2[2] = {0.25, 0.75};
+    for (int r = 0; r < 2; r++) {
+        char path[] = "build/test-memclock-XXXXXX";
+        int fd = mkstemp(path);
+        CHECK(fd >= 0, "mkstemp");
+        if (fd < 0) return;
+        close(fd);
+        memory_t *m;
+        CHECK(!memory_open(path, true, &m), "open: %s", last_error());
+        CHECK(memory_set_clock(m, 0) && strstr(last_error(), "clock"), "clock start 0 accepted");
+        CHECK(!memory_set_clock(m, 1000), "set clock: %s", last_error());
+        for (int k = 0; k < 3; k++) {
+            jval *v;
+            decision_t d;
+            json_parse(&a, ROW1, strlen(ROW1), &v);
+            decision_validate(v, &d);
+            CHECK(!memory_append(m, &d, p2, "00", PROMPT_VERSION, "rev", 0, NULL), "append: %s", last_error());
+        }
+        memory_root_json(m, &root[r]);
+        memory_close(m);
+        read_file(path, &text[r], &len[r]);
+        remove(path);
+    }
+    CHECK(text[0] && text[1] && len[0] == len[1] && !memcmp(text[0], text[1], len[0]), "clocked memory files differ");
+    CHECK(root[0].data && root[1].data && !strcmp(root[0].data, root[1].data), "clocked roots differ");
+    CHECK(text[0] && strstr(text[0], "\"time_us\": 1000,") && strstr(text[0], "\"time_us\": 1002,"),
+          "clocked timestamps are not 1000..1002");
+    free(text[0]), free(text[1]);
+    sb_free(&root[0]), sb_free(&root[1]);
+    arena_free(&a);
+}
+
 int main(void) {
     test_sha256();
     test_shake256();
@@ -426,6 +465,7 @@ int main(void) {
     test_float_repr_roundtrip();
     test_verify();
     test_memory();
+    test_memory_clock();
     if (failures) {
         printf("%d unit check(s) failed\n", failures);
         return 1;
