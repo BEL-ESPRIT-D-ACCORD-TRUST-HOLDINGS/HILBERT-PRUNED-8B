@@ -18,6 +18,9 @@ No model weights or third-party raw evaluation records are distributed here.
 | Qwen3.5-4B GGUF | https://huggingface.co/bartowski/Qwen_Qwen3.5-4B-GGUF | `4168f45a16a1290d65a4ec0fa312ae917a4c15d6` | External Q4_K_M browser model; weights are not redistributed. |
 | Qwen3.8-27B exl3 quant | https://huggingface.co/turboderp/Qwen3.8-27B-exl3 | `a35e75a73baee51da709329d19294245cbeeb5d8` (5.00bpw) | Probe checkpoint for `exl3-bridge/`; upstream (turboderp) terms and Qwen base-model license apply. |
 | exllamav3 | https://github.com/turboderp-org/exllamav3 | `1.4.4+cu128.torch2.10.0` | Bridge runtime (`exl3-bridge/`); MIT. |
+| Cloudscape Design System | https://github.com/cloudscape-design/components | components `3.0.1386`, global-styles `1.0.70`, design-tokens `3.0.113` | `playground/` UI, bundled into its build; Apache-2.0. |
+| React | https://github.com/facebook/react | `19.3.0` | `playground/` UI runtime, bundled into its build; MIT. |
+| WasmKit | https://github.com/swiftwasm/WasmKit | `0.2.2` (`playground/swift/Package.resolved`) | Swift host for the playground's WebAssembly core; MIT. Not redistributed. |
 
 These URLs were checked on 2026-09-18. Downloaded evaluation inputs are pinned by SHA-256.
 
